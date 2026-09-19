@@ -4,7 +4,7 @@ Flashing firmware can leave a device unbootable if power or USB is interrupted. 
 
 ## Build outputs
 
-After `./scripts/build.sh`, the relevant files are under:
+After `bash scripts/build.sh`, the relevant files are under:
 
 ```text
 work/MeshCore/.pio/build/Tbeam_SX1276_companion_radio_ble_ps/

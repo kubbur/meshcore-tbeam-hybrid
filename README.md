@@ -43,7 +43,7 @@ The patch series applies to MeshCore base commit:
 With Git and PlatformIO installed:
 
 ```bash
-./scripts/build.sh
+bash scripts/build.sh
 ```
 
 The script clones the exact upstream revision into `work/MeshCore`, applies the three patches and builds the power-saving target. Build outputs are created under:

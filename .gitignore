@@ -1,0 +1,12 @@
+work/
+.pio/
+*.bin
+*.elf
+*.map
+*.log
+*.zip
+*flash*.dump
+*nvs*.img
+*nvs*.bin
+*spiffs*.img
+*spiffs*.bin

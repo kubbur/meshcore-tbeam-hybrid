@@ -1,0 +1,289 @@
+From 01e143575f67304c7f9e22150393bc86054bac88 Mon Sep 17 00:00:00 2001
+From: kubbur <kubbur@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 15:56:39 +0000
+Subject: [PATCH 2/3] fix: preserve T-Beam power-saving behavior
+
+---
+ examples/companion_radio/main.cpp             | 39 +++++++++++++++++++
+ platformio.local.ini                          |  4 +-
+ src/helpers/ArduinoSerialInterface.cpp        |  6 ++-
+ src/helpers/ArduinoSerialInterface.h          |  3 +-
+ src/helpers/BaseSerialInterface.h             |  1 +
+ src/helpers/MultiSerialInterface.h            | 14 +++++++
+ src/helpers/esp32/SerialBLEInterface.cpp      |  4 ++
+ src/helpers/esp32/SerialBLEInterface.h        |  1 +
+ src/helpers/esp32/SerialWifiInterface.cpp     |  6 ++-
+ src/helpers/esp32/SerialWifiInterface.h       |  1 +
+ .../ethernet/SerialEthernetInterface.cpp      |  4 ++
+ .../ethernet/SerialEthernetInterface.h        |  1 +
+ src/helpers/nrf52/SerialBLEInterface.cpp      |  4 ++
+ src/helpers/nrf52/SerialBLEInterface.h        |  1 +
+ 14 files changed, 85 insertions(+), 4 deletions(-)
+
+diff --git a/examples/companion_radio/main.cpp b/examples/companion_radio/main.cpp
+index 89f0e6cb..07ee269e 100644
+--- a/examples/companion_radio/main.cpp
++++ b/examples/companion_radio/main.cpp
+@@ -2,6 +2,11 @@
+ #include <Mesh.h>
+ #include "MyMesh.h"
+ 
++#ifdef ESP32_PLATFORM
++#include "esp_pm.h"
++#include "esp_bt.h"
++#endif
++
+ // Believe it or not, this std C function is busted on some platforms!
+ static uint32_t _atoi(const char* sp) {
+   uint32_t n = 0;
+@@ -242,6 +247,36 @@ void setup() {
+ #endif
+ 
+   board.onBootComplete();
++
++#ifdef ESP32_PLATFORM
++#if !CONFIG_IDF_TARGET_ESP32C6
++  // Match the BLE sleep behaviour of the original PowerSaving17 build.
++  esp_err_t errBLESleep = esp_bt_sleep_enable();
++  if (errBLESleep == ESP_OK) {
++    Serial.println("Bluetooth sleep enabled successfully");
++  } else {
++    Serial.printf("Bluetooth sleep enable failed: %s\n", esp_err_to_name(errBLESleep));
++  }
++#endif
++
++#if CONFIG_IDF_TARGET_ESP32C3
++  esp_pm_config_esp32c3_t pm_config;
++#elif CONFIG_IDF_TARGET_ESP32S3
++  esp_pm_config_esp32s3_t pm_config;
++#elif CONFIG_IDF_TARGET_ESP32
++  esp_pm_config_esp32_t pm_config;
++#elif CONFIG_IDF_TARGET_ESP32C6
++  esp_pm_config_t pm_config;
++#endif
++
++  pm_config = { .max_freq_mhz = 80, .min_freq_mhz = 40, .light_sleep_enable = true };
++  esp_err_t errPM = esp_pm_configure(&pm_config);
++  if (errPM == ESP_OK) {
++    Serial.println("Power Management configured successfully");
++  } else {
++    Serial.printf("Power Management failed to configure: %d\r\n", errPM);
++  }
++#endif
+ }
+ 
+ void loop() {
+@@ -259,6 +294,10 @@ void loop() {
+   if (!the_mesh.hasPendingWork()) {
+ #if defined(NRF52_PLATFORM)
+     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
++#elif defined(ESP32_PLATFORM) && defined(BLE_PIN_CODE)
++    if (!bluetooth_interface.isReadBusy() && !bluetooth_interface.isWriteBusy()) {
++      vTaskDelay(pdMS_TO_TICKS(10));  // allow automatic light sleep when BLE is idle
++    }
+ #endif
+   }
+ 
+diff --git a/platformio.local.ini b/platformio.local.ini
+index c79e681c..bf97b2c8 100644
+--- a/platformio.local.ini
++++ b/platformio.local.ini
+@@ -1,8 +1,10 @@
+ [env:Tbeam_SX1276_companion_radio_ble_ps]
+ extends = env:Tbeam_SX1276_companion_radio_ble
++; Match the PowerSaving17 firmware family originally installed on this device.
++platform_packages = platformio/framework-arduinoespressif32@https://github.com/IoTThinks/powersaving-arduino-lib/releases/download/2.0.17/esp32-2.0.17.zip
+ build_flags =
+   ${env:Tbeam_SX1276_companion_radio_ble.build_flags}
+-  '-D FIRMWARE_VERSION="v1.17.1-hybrid"'
++  '-D FIRMWARE_VERSION="v1.17.1-hybrid-ps"'
+   '-D FIRMWARE_BUILD_DATE="16 Sep 2026"'
+   '-D ALLOWED_REPEAT_FREQ_RANGE={433000,433000},{869495,869495},{869618,869618},{918000,918000}'
+   -D HYBRID_REMOTE_ADMIN=1
+diff --git a/src/helpers/ArduinoSerialInterface.cpp b/src/helpers/ArduinoSerialInterface.cpp
+index a01fa586..5c472d98 100644
+--- a/src/helpers/ArduinoSerialInterface.cpp
++++ b/src/helpers/ArduinoSerialInterface.cpp
+@@ -13,10 +13,14 @@ void ArduinoSerialInterface::disable() {
+   _isEnabled = false;
+ }
+ 
+-bool ArduinoSerialInterface::isConnected() const { 
++bool ArduinoSerialInterface::isConnected() const {
+   return true;   // no way of knowing, so assume yes
+ }
+ 
++bool ArduinoSerialInterface::isReadBusy() const {
++  return false;
++}
++
+ bool ArduinoSerialInterface::isWriteBusy() const {
+   return false;
+ }
+diff --git a/src/helpers/ArduinoSerialInterface.h b/src/helpers/ArduinoSerialInterface.h
+index c4086353..4fa2b75d 100644
+--- a/src/helpers/ArduinoSerialInterface.h
++++ b/src/helpers/ArduinoSerialInterface.h
+@@ -28,7 +28,8 @@ public:
+ 
+   bool isConnected() const override;
+ 
++  bool isReadBusy() const override;
+   bool isWriteBusy() const override;
+   size_t writeFrame(const uint8_t src[], size_t len) override;
+   size_t checkRecvFrame(uint8_t dest[]) override;
+-};
+\ No newline at end of file
++};
+diff --git a/src/helpers/BaseSerialInterface.h b/src/helpers/BaseSerialInterface.h
+index 23933fcb..818f7186 100644
+--- a/src/helpers/BaseSerialInterface.h
++++ b/src/helpers/BaseSerialInterface.h
+@@ -16,6 +16,7 @@ public:
+   virtual bool isConnected() const = 0;
+   virtual void loop() {};
+ 
++  virtual bool isReadBusy() const = 0;
+   virtual bool isWriteBusy() const = 0;
+   virtual size_t writeFrame(const uint8_t src[], size_t len) = 0;
+   virtual size_t checkRecvFrame(uint8_t dest[]) = 0;
+diff --git a/src/helpers/MultiSerialInterface.h b/src/helpers/MultiSerialInterface.h
+index f7742b24..1ebf0bc0 100644
+--- a/src/helpers/MultiSerialInterface.h
++++ b/src/helpers/MultiSerialInterface.h
+@@ -140,6 +140,20 @@ public:
+     }
+   }
+ 
++  bool isReadBusy() const override {
++    if (!_enabled) {
++      return false;
++    }
++
++    for (auto iface : _interfaces) {
++      if (iface.instance && iface.instance->isEnabled() && iface.instance->isReadBusy()) {
++        return true;
++      }
++    }
++
++    return false;
++  }
++
+   bool isWriteBusy() const override {
+     // not busy when disabled
+     if(!_enabled){
+diff --git a/src/helpers/esp32/SerialBLEInterface.cpp b/src/helpers/esp32/SerialBLEInterface.cpp
+index 6371cf33..2e1343f5 100644
+--- a/src/helpers/esp32/SerialBLEInterface.cpp
++++ b/src/helpers/esp32/SerialBLEInterface.cpp
+@@ -188,6 +188,10 @@ size_t SerialBLEInterface::writeFrame(const uint8_t src[], size_t len) {
+ 
+ #define  BLE_WRITE_MIN_INTERVAL   60
+ 
++bool SerialBLEInterface::isReadBusy() const {
++  return uxQueueMessagesWaiting(recv_queue) > 0;
++}
++
+ bool SerialBLEInterface::isWriteBusy() const {
+   return millis() < _last_write + BLE_WRITE_MIN_INTERVAL;   // still too soon to start another write?
+ }
+diff --git a/src/helpers/esp32/SerialBLEInterface.h b/src/helpers/esp32/SerialBLEInterface.h
+index 9fb6adba..3298011b 100644
+--- a/src/helpers/esp32/SerialBLEInterface.h
++++ b/src/helpers/esp32/SerialBLEInterface.h
+@@ -82,6 +82,7 @@ public:
+ 
+   bool isConnected() const override;
+ 
++  bool isReadBusy() const override;
+   bool isWriteBusy() const override;
+   size_t writeFrame(const uint8_t src[], size_t len) override;
+   size_t checkRecvFrame(uint8_t dest[]) override;
+diff --git a/src/helpers/esp32/SerialWifiInterface.cpp b/src/helpers/esp32/SerialWifiInterface.cpp
+index 462e3ecc..25ba4c22 100644
+--- a/src/helpers/esp32/SerialWifiInterface.cpp
++++ b/src/helpers/esp32/SerialWifiInterface.cpp
+@@ -39,6 +39,10 @@ size_t SerialWifiInterface::writeFrame(const uint8_t src[], size_t len) {
+   return 0;
+ }
+ 
++bool SerialWifiInterface::isReadBusy() const {
++  return false;
++}
++
+ bool SerialWifiInterface::isWriteBusy() const {
+   return false;
+ }
+@@ -169,4 +173,4 @@ size_t SerialWifiInterface::checkRecvFrame(uint8_t dest[]) {
+ 
+ bool SerialWifiInterface::isConnected() const {
+   return deviceConnected;  //pServer != NULL && pServer->getConnectedCount() > 0;
+-}
+\ No newline at end of file
++}
+diff --git a/src/helpers/esp32/SerialWifiInterface.h b/src/helpers/esp32/SerialWifiInterface.h
+index 19291497..1ff1d83d 100644
+--- a/src/helpers/esp32/SerialWifiInterface.h
++++ b/src/helpers/esp32/SerialWifiInterface.h
+@@ -52,6 +52,7 @@ public:
+   bool isEnabled() const override { return _isEnabled; }
+ 
+   bool isConnected() const override;
++  bool isReadBusy() const override;
+   bool isWriteBusy() const override;
+ 
+   size_t writeFrame(const uint8_t src[], size_t len) override;
+diff --git a/src/helpers/ethernet/SerialEthernetInterface.cpp b/src/helpers/ethernet/SerialEthernetInterface.cpp
+index 22bcabc1..2ce6a5df 100644
+--- a/src/helpers/ethernet/SerialEthernetInterface.cpp
++++ b/src/helpers/ethernet/SerialEthernetInterface.cpp
+@@ -40,6 +40,10 @@ size_t SerialEthernetInterface::writeFrame(const uint8_t src[], size_t len) {
+   return 0;
+ }
+ 
++bool SerialEthernetInterface::isReadBusy() const {
++  return false;
++}
++
+ bool SerialEthernetInterface::isWriteBusy() const {
+   return false;
+ }
+diff --git a/src/helpers/ethernet/SerialEthernetInterface.h b/src/helpers/ethernet/SerialEthernetInterface.h
+index 46789f71..8545a29b 100644
+--- a/src/helpers/ethernet/SerialEthernetInterface.h
++++ b/src/helpers/ethernet/SerialEthernetInterface.h
+@@ -52,6 +52,7 @@ class SerialEthernetInterface : public BaseSerialInterface {
+     bool isEnabled() const override { return _isEnabled; }
+ 
+     bool isConnected() const override;
++    bool isReadBusy() const override;
+     bool isWriteBusy() const override;
+ 
+     size_t writeFrame(const uint8_t src[], size_t len) override;
+diff --git a/src/helpers/nrf52/SerialBLEInterface.cpp b/src/helpers/nrf52/SerialBLEInterface.cpp
+index 75a4e3b0..b9c9ae9a 100644
+--- a/src/helpers/nrf52/SerialBLEInterface.cpp
++++ b/src/helpers/nrf52/SerialBLEInterface.cpp
+@@ -401,6 +401,10 @@ bool SerialBLEInterface::isConnected() const {
+   return _isDeviceConnected && Bluefruit.connected() > 0;
+ }
+ 
++bool SerialBLEInterface::isReadBusy() const {
++  return recv_queue_len > 0;
++}
++
+ bool SerialBLEInterface::isWriteBusy() const {
+   return send_queue_len >= (FRAME_QUEUE_SIZE * 2 / 3);
+ }
+diff --git a/src/helpers/nrf52/SerialBLEInterface.h b/src/helpers/nrf52/SerialBLEInterface.h
+index de103054..d3cc5055 100644
+--- a/src/helpers/nrf52/SerialBLEInterface.h
++++ b/src/helpers/nrf52/SerialBLEInterface.h
+@@ -66,6 +66,7 @@ public:
+   void disable() override;
+   bool isEnabled() const override { return _isEnabled; }
+   bool isConnected() const override;
++  bool isReadBusy() const override;
+   bool isWriteBusy() const override;
+   size_t writeFrame(const uint8_t src[], size_t len) override;
+   size_t checkRecvFrame(uint8_t dest[]) override;

@@ -1,0 +1,1050 @@
+From f6a1ee2e66916ac7adcabac11593b7fcc7906f14 Mon Sep 17 00:00:00 2001
+From: kubbur <kubbur@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 01:07:46 +0000
+Subject: [PATCH 1/3] feat: add T-Beam hybrid companion repeater
+
+---
+ .../companion_radio/HybridRemoteAdmin.cpp     | 438 ++++++++++++++++++
+ examples/companion_radio/MyMesh.cpp           | 134 +++++-
+ examples/companion_radio/MyMesh.h             | 100 +++-
+ examples/companion_radio/NodePrefs.h          |  91 +++-
+ platformio.local.ini                          |  14 +
+ src/helpers/BaseChatMesh.cpp                  |   6 +-
+ src/helpers/BaseChatMesh.h                    |   3 +
+ src/helpers/CommonCLI.h                       |   4 +
+ 8 files changed, 772 insertions(+), 18 deletions(-)
+ create mode 100644 examples/companion_radio/HybridRemoteAdmin.cpp
+ create mode 100644 platformio.local.ini
+
+diff --git a/examples/companion_radio/HybridRemoteAdmin.cpp b/examples/companion_radio/HybridRemoteAdmin.cpp
+new file mode 100644
+index 00000000..ca1fa2e1
+--- /dev/null
++++ b/examples/companion_radio/HybridRemoteAdmin.cpp
+@@ -0,0 +1,438 @@
++#include "MyMesh.h"
++
++#ifdef HYBRID_REMOTE_ADMIN
++
++#include <algorithm>
++
++#define HYBRID_REQ_TYPE_GET_ACCESS_LIST  0x05
++#define HYBRID_REQ_TYPE_GET_NEIGHBOURS   0x06
++#define HYBRID_REQ_TYPE_GET_OWNER_INFO   0x07
++#define HYBRID_FIRMWARE_VER_LEVEL        2
++#define HYBRID_SERVER_RESPONSE_DELAY     300
++#define HYBRID_LAZY_ACL_WRITE_DELAY      5000
++
++void MyMesh::seedAdminContact(const mesh::Identity& id) {
++  if (lookupContactByPubKey(id.pub_key, PUB_KEY_SIZE)) return;
++
++  ContactInfo contact;
++  memset(&contact, 0, sizeof(contact));
++  contact.id = id;
++  contact.type = ADV_TYPE_NONE;
++  contact.out_path_len = OUT_PATH_UNKNOWN;
++  contact.lastmod = getRTCClock()->getCurrentTime();
++  addContact(contact);
++}
++
++uint8_t MyMesh::handleAdminLogin(const mesh::Identity& sender, const uint8_t* secret,
++                                 uint32_t sender_timestamp, const char* password, bool is_flood) {
++  ClientInfo* client = NULL;
++  if (password[0] == 0) {
++    client = admin_acl.getClient(sender.pub_key, PUB_KEY_SIZE);
++  }
++
++  if (client == NULL) {
++    uint8_t permissions;
++    if (_prefs.password[0] && strcmp(password, _prefs.password) == 0) {
++      permissions = PERM_ACL_ADMIN;
++    } else if (_prefs.guest_password[0] && strcmp(password, _prefs.guest_password) == 0) {
++      permissions = PERM_ACL_GUEST;
++    } else {
++      return 0;
++    }
++
++    client = admin_acl.putClient(sender, 0);
++    if (client == NULL || sender_timestamp <= client->last_timestamp) {
++      MESH_DEBUG_PRINTLN("Hybrid admin: possible login replay attack");
++      return 0;
++    }
++
++    client->last_timestamp = sender_timestamp;
++    client->last_activity = getRTCClock()->getCurrentTime();
++    client->permissions &= ~PERM_ACL_ROLE_MASK;
++    client->permissions |= permissions;
++    memcpy(client->shared_secret, secret, PUB_KEY_SIZE);
++
++    if (permissions != PERM_ACL_GUEST) {
++      dirty_admin_acl_expiry = futureMillis(HYBRID_LAZY_ACL_WRITE_DELAY);
++    }
++  }
++
++  if (is_flood) client->out_path_len = OUT_PATH_UNKNOWN;
++  seedAdminContact(sender);
++
++  uint32_t now = getRTCClock()->getCurrentTimeUnique();
++  memcpy(admin_reply_data, &now, 4);
++  admin_reply_data[4] = RESP_SERVER_LOGIN_OK;
++  admin_reply_data[5] = 0;
++  admin_reply_data[6] = client->isAdmin() ? 1 : 0;
++  admin_reply_data[7] = client->permissions;
++  getRNG()->random(&admin_reply_data[8], 4);
++  admin_reply_data[12] = HYBRID_FIRMWARE_VER_LEVEL;
++  return 13;
++}
++
++void MyMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender,
++                            uint8_t* data, size_t len) {
++  if (packet->getPayloadType() != PAYLOAD_TYPE_ANON_REQ || len < 5 || len >= MAX_PACKET_PAYLOAD) return;
++
++  uint32_t sender_timestamp;
++  memcpy(&sender_timestamp, data, 4);
++  data[len] = 0;
++
++  uint8_t reply_len = handleAdminLogin(sender, secret, sender_timestamp,
++                                       reinterpret_cast<const char*>(&data[4]), packet->isRouteFlood());
++  if (reply_len == 0) return;
++
++  ContactInfo* contact = lookupContactByPubKey(sender.pub_key, PUB_KEY_SIZE);
++  if (contact == NULL) return;
++
++  if (packet->isRouteFlood()) {
++    mesh::Packet* path = createPathReturn(sender, secret, packet->path, packet->path_len,
++                                          PAYLOAD_TYPE_RESPONSE, admin_reply_data, reply_len);
++    if (path) sendFloodScoped(*contact, path, HYBRID_SERVER_RESPONSE_DELAY);
++    return;
++  }
++
++  mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, admin_reply_data, reply_len);
++  if (reply == NULL) return;
++
++  if (contact->out_path_len != OUT_PATH_UNKNOWN) {
++    sendDirect(reply, contact->out_path, contact->out_path_len, HYBRID_SERVER_RESPONSE_DELAY);
++  } else {
++    sendFloodScoped(*contact, reply, HYBRID_SERVER_RESPONSE_DELAY);
++  }
++}
++
++uint8_t MyMesh::handleAdminRequest(ClientInfo* sender, uint32_t sender_timestamp,
++                                   const uint8_t* payload, size_t payload_len) {
++  memcpy(admin_reply_data, &sender_timestamp, 4);
++  if (payload_len == 0) return 0;
++
++  if (payload[0] == REQ_TYPE_GET_STATUS) {
++    HybridRepeaterStats stats;
++    stats.batt_milli_volts = board.getBattMilliVolts();
++    stats.curr_tx_queue_len = _mgr->getOutboundTotal();
++    stats.noise_floor = (int16_t)_radio->getNoiseFloor();
++    stats.last_rssi = (int16_t)radio_driver.getLastRSSI();
++    stats.n_packets_recv = radio_driver.getPacketsRecv();
++    stats.n_packets_sent = radio_driver.getPacketsSent();
++    stats.total_air_time_secs = getTotalAirTime() / 1000;
++    stats.total_up_time_secs = uptime_millis / 1000;
++    stats.n_sent_flood = getNumSentFlood();
++    stats.n_sent_direct = getNumSentDirect();
++    stats.n_recv_flood = getNumRecvFlood();
++    stats.n_recv_direct = getNumRecvDirect();
++    stats.err_events = _err_flags;
++    stats.last_snr = (int16_t)(radio_driver.getLastSNR() * 4);
++    stats.n_direct_dups = ((SimpleMeshTables*)getTables())->getNumDirectDups();
++    stats.n_flood_dups = ((SimpleMeshTables*)getTables())->getNumFloodDups();
++    stats.total_rx_air_time_secs = getReceiveAirTime() / 1000;
++    stats.n_recv_errors = radio_driver.getPacketsRecvErrors();
++    memcpy(&admin_reply_data[4], &stats, sizeof(stats));
++    return 4 + sizeof(stats);
++  }
++
++  if (payload[0] == REQ_TYPE_GET_TELEMETRY_DATA && payload_len >= 2) {
++    uint8_t permissions = ~(payload[1]);
++    if ((sender->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST) permissions = 0;
++
++    telemetry.reset();
++    telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
++    sensors.querySensors(permissions, telemetry);
++    float temperature = board.getMCUTemperature();
++    if (!isnan(temperature)) telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature);
++
++    uint8_t telemetry_len = telemetry.getSize();
++    memcpy(&admin_reply_data[4], telemetry.getBuffer(), telemetry_len);
++    return 4 + telemetry_len;
++  }
++
++  if (payload[0] == HYBRID_REQ_TYPE_GET_ACCESS_LIST && sender->isAdmin() && payload_len >= 3) {
++    if (payload[1] != 0 || payload[2] != 0) return 0;
++    uint8_t offset = 4;
++    for (int i = 0; i < admin_acl.getNumClients() && offset + 7 <= sizeof(admin_reply_data); i++) {
++      ClientInfo* client = admin_acl.getClientByIdx(i);
++      if (client->permissions == 0) continue;
++      memcpy(&admin_reply_data[offset], client->id.pub_key, 6);
++      offset += 6;
++      admin_reply_data[offset++] = client->permissions;
++    }
++    return offset;
++  }
++
++  if (payload[0] == HYBRID_REQ_TYPE_GET_NEIGHBOURS && payload_len >= 11 && payload[1] == 0) {
++    uint8_t count = payload[2];
++    uint16_t offset;
++    memcpy(&offset, &payload[3], 2);
++    uint8_t order_by = payload[5];
++    uint8_t prefix_len = min(payload[6], (uint8_t)PUB_KEY_SIZE);
++
++    int16_t neighbour_count = 0;
++    HybridNeighbourInfo* sorted[MAX_NEIGHBOURS];
++    for (int i = 0; i < MAX_NEIGHBOURS; i++) {
++      if (hybrid_neighbours[i].heard_timestamp) sorted[neighbour_count++] = &hybrid_neighbours[i];
++    }
++    if (order_by == 0) {
++      std::sort(sorted, sorted + neighbour_count,
++                [](const HybridNeighbourInfo* a, const HybridNeighbourInfo* b) {
++                  return a->heard_timestamp > b->heard_timestamp;
++                });
++    } else if (order_by == 1) {
++      std::sort(sorted, sorted + neighbour_count,
++                [](const HybridNeighbourInfo* a, const HybridNeighbourInfo* b) {
++                  return a->heard_timestamp < b->heard_timestamp;
++                });
++    } else if (order_by == 2) {
++      std::sort(sorted, sorted + neighbour_count,
++                [](const HybridNeighbourInfo* a, const HybridNeighbourInfo* b) { return a->snr > b->snr; });
++    } else if (order_by == 3) {
++      std::sort(sorted, sorted + neighbour_count,
++                [](const HybridNeighbourInfo* a, const HybridNeighbourInfo* b) { return a->snr < b->snr; });
++    }
++
++    uint8_t results[130];
++    int results_len = 0;
++    uint16_t results_count = 0;
++    for (int i = 0; i < count && i + offset < neighbour_count; i++) {
++      int entry_len = prefix_len + 5;
++      if (results_len + entry_len > (int)sizeof(results)) break;
++      HybridNeighbourInfo* neighbour = sorted[i + offset];
++      uint32_t seconds_ago = getRTCClock()->getCurrentTime() - neighbour->heard_timestamp;
++      memcpy(&results[results_len], neighbour->id.pub_key, prefix_len);
++      results_len += prefix_len;
++      memcpy(&results[results_len], &seconds_ago, 4);
++      results_len += 4;
++      results[results_len++] = neighbour->snr;
++      results_count++;
++    }
++
++    int reply_offset = 4;
++    memcpy(&admin_reply_data[reply_offset], &neighbour_count, 2);
++    reply_offset += 2;
++    memcpy(&admin_reply_data[reply_offset], &results_count, 2);
++    reply_offset += 2;
++    memcpy(&admin_reply_data[reply_offset], results, results_len);
++    return reply_offset + results_len;
++  }
++
++  if (payload[0] == HYBRID_REQ_TYPE_GET_OWNER_INFO) {
++    snprintf((char*)&admin_reply_data[4], sizeof(admin_reply_data) - 4, "%s\n%s\n%s",
++             FIRMWARE_VERSION, _prefs.node_name, _prefs.owner_info);
++    return 4 + strlen((char*)&admin_reply_data[4]);
++  }
++
++  return 0;
++}
++
++void MyMesh::handleAdminCommand(uint32_t sender_timestamp, char* command, char* reply) {
++  if (memcmp(command, "setperm ", 8) == 0) {
++    char* hex = &command[8];
++    char* separator = strchr(hex, ' ');
++    if (separator == NULL) {
++      strcpy(reply, "Err - bad params");
++      return;
++    }
++
++    *separator++ = 0;
++    uint8_t pubkey[PUB_KEY_SIZE];
++    int hex_len = min((int)(separator - hex - 1), PUB_KEY_SIZE * 2);
++    int key_len = hex_len / 2;
++    uint8_t permissions = atoi(separator);
++    if (!mesh::Utils::fromHex(pubkey, key_len, hex) ||
++        !admin_acl.applyPermissions(self_id, pubkey, key_len, permissions)) {
++      strcpy(reply, "Err - invalid params");
++      return;
++    }
++
++    if ((permissions & PERM_ACL_ROLE_MASK) != PERM_ACL_GUEST) {
++      seedAdminContact(mesh::Identity(pubkey));
++    }
++    dirty_admin_acl_expiry = futureMillis(HYBRID_LAZY_ACL_WRITE_DELAY);
++    strcpy(reply, "OK");
++    return;
++  }
++
++  if (strncmp(command, "set repeat", 10) == 0) {
++    if (strstr(command, "off")) {
++      strcpy(reply, "Error: repeat is locked on in hybrid firmware");
++    } else {
++      _prefs.setRepeatEn(true);
++      savePrefs();
++      strcpy(reply, "OK - repeat is locked ON");
++    }
++    return;
++  }
++  if (strcmp(command, "get repeat") == 0) {
++    strcpy(reply, "> on (locked)");
++    return;
++  }
++
++  if (strncmp(command, "set radio ", 10) == 0) {
++    uint32_t freq_khz = (uint32_t)(strtof(command + 10, NULL) * 1000.0f + 0.5f);
++    if (!isValidClientRepeatFreq(freq_khz)) {
++      strcpy(reply, "Error: frequency is not allowed for always-on repeat");
++      return;
++    }
++  }
++  if (strncmp(command, "set tx ", 7) == 0) {
++    int power = atoi(command + 7);
++    if (power < -9 || power > MAX_LORA_TX_POWER) {
++      strcpy(reply, "Error: TX power out of range");
++      return;
++    }
++  }
++
++  static const char* unsupported[] = {
++    "start ota", "tempradio ", "region", "powersaving", "log ",
++    "set flood.", "set loop.", "set int.thresh", "set cad", "set agc.reset.interval",
++    "set allow.read.only", "set adc.multiplier", "set lat ", "set lon "
++  };
++  for (const char* prefix : unsupported) {
++    if (strncmp(command, prefix, strlen(prefix)) == 0) {
++      strcpy(reply, "Error: unsupported by hybrid companion");
++      return;
++    }
++  }
++
++  admin_cli.handleCommand(sender_timestamp, command, reply);
++  _prefs.setRepeatEn(true);
++}
++
++void MyMesh::putHybridNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr) {
++  uint32_t oldest = 0xFFFFFFFF;
++  HybridNeighbourInfo* target = &hybrid_neighbours[0];
++  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
++    if (id.matches(hybrid_neighbours[i].id)) {
++      target = &hybrid_neighbours[i];
++      break;
++    }
++    if (hybrid_neighbours[i].heard_timestamp < oldest) {
++      oldest = hybrid_neighbours[i].heard_timestamp;
++      target = &hybrid_neighbours[i];
++    }
++  }
++  target->id = id;
++  target->advert_timestamp = timestamp;
++  target->heard_timestamp = getRTCClock()->getCurrentTime();
++  target->snr = (int8_t)(snr * 4);
++}
++
++void MyMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
++                          const uint8_t* app_data, size_t app_data_len) {
++  BaseChatMesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len);
++  if (packet->getPathHashCount() != 0) return;
++
++  AdvertDataParser parser(app_data, app_data_len);
++  if (parser.isValid() && parser.getType() == ADV_TYPE_REPEATER) {
++    putHybridNeighbour(id, timestamp, packet->getSNR());
++  }
++}
++
++void MyMesh::savePrefs() {
++  _prefs.node_lat = sensors.node_lat;
++  _prefs.node_lon = sensors.node_lon;
++  _prefs.setRepeatEn(true);
++  _store->savePrefs(_prefs);
++}
++
++bool MyMesh::saveAdminACL() {
++  admin_acl.save(_store->getPrimaryFS());
++  return true;
++}
++
++void MyMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
++  mesh::Packet* packet;
++  if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
++    packet = createSelfAdvert(_prefs.node_name);
++  } else {
++    packet = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
++  }
++  if (packet == NULL) return;
++
++  if (flood) {
++    TransportKey scope;
++    memcpy(scope.key, _prefs.default_scope_key, sizeof(scope.key));
++    sendFloodScoped(scope, packet, delay_millis);
++  } else {
++    sendZeroHop(packet, delay_millis);
++  }
++}
++
++void MyMesh::updateAdvertTimer() {
++  if (_prefs.advert_interval) {
++    next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000);
++  } else {
++    next_local_advert = 0;
++  }
++}
++
++void MyMesh::updateFloodAdvertTimer() {
++  if (_prefs.flood_advert_interval) {
++    next_flood_advert = futureMillis((uint32_t)_prefs.flood_advert_interval * 60 * 60 * 1000);
++  } else {
++    next_flood_advert = 0;
++  }
++}
++
++void MyMesh::setTxPower(int8_t power_dbm) {
++  radio_driver.setTxPower(power_dbm);
++}
++
++void MyMesh::formatNeighborsReply(char* reply) {
++  HybridNeighbourInfo* sorted[MAX_NEIGHBOURS];
++  int count = 0;
++  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
++    if (hybrid_neighbours[i].heard_timestamp) sorted[count++] = &hybrid_neighbours[i];
++  }
++  std::sort(sorted, sorted + count, [](const HybridNeighbourInfo* a, const HybridNeighbourInfo* b) {
++    return a->heard_timestamp > b->heard_timestamp;
++  });
++
++  char* dest = reply;
++  for (int i = 0; i < count && dest - reply < 134; i++) {
++    if (i) *dest++ = '\n';
++    char hex[10];
++    mesh::Utils::toHex(hex, sorted[i]->id.pub_key, 4);
++    uint32_t seconds_ago = getRTCClock()->getCurrentTime() - sorted[i]->heard_timestamp;
++    sprintf(dest, "%s:%u:%d", hex, seconds_ago, sorted[i]->snr);
++    dest = strchr(dest, 0);
++  }
++  if (dest == reply) strcpy(dest, "-none-");
++}
++
++void MyMesh::removeNeighbor(const uint8_t* pubkey, int key_len) {
++  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
++    if (memcmp(hybrid_neighbours[i].id.pub_key, pubkey, key_len) == 0) {
++      hybrid_neighbours[i] = HybridNeighbourInfo();
++    }
++  }
++}
++
++void MyMesh::formatStatsReply(char* reply) {
++  StatsFormatHelper::formatCoreStats(reply, board, *_ms, _err_flags, _mgr);
++}
++
++void MyMesh::formatRadioStatsReply(char* reply) {
++  StatsFormatHelper::formatRadioStats(reply, _radio, radio_driver, getTotalAirTime(), getReceiveAirTime());
++}
++
++void MyMesh::formatPacketStatsReply(char* reply) {
++  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(),
++                                       getNumRecvFlood(), getNumRecvDirect());
++}
++
++void MyMesh::saveIdentity(const mesh::LocalIdentity& new_id) {
++  _store->saveMainIdentity(new_id);
++}
++
++void MyMesh::clearStats() {
++  radio_driver.resetStats();
++  resetStats();
++  ((SimpleMeshTables*)getTables())->resetStats();
++}
++
++bool MyMesh::setRxBoostedGain(bool enable) {
++  return radio_driver.setRxBoostedGainMode(enable);
++}
++
++#endif
+diff --git a/examples/companion_radio/MyMesh.cpp b/examples/companion_radio/MyMesh.cpp
+index 2c334066..5af12a71 100644
+--- a/examples/companion_radio/MyMesh.cpp
++++ b/examples/companion_radio/MyMesh.cpp
+@@ -271,11 +271,19 @@ int MyMesh::calcRxDelay(float score, uint32_t air_time) const {
+ }
+ 
+ uint32_t MyMesh::getRetransmitDelay(const mesh::Packet *packet) {
+-  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * 0.5f);
++  float factor = 0.5f;
++#ifdef HYBRID_REMOTE_ADMIN
++  factor = _prefs.tx_delay_factor;
++#endif
++  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * factor);
+   return getRNG()->nextInt(0, 5*t + 1);
+ }
+ uint32_t MyMesh::getDirectRetransmitDelay(const mesh::Packet *packet) {
+-  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * 0.2f);
++  float factor = 0.2f;
++#ifdef HYBRID_REMOTE_ADMIN
++  factor = _prefs.direct_tx_delay_factor;
++#endif
++  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * factor);
+   return getRNG()->nextInt(0, 5*t + 1);
+ }
+ 
+@@ -483,7 +491,11 @@ bool MyMesh::filterRecvFloodPacket(mesh::Packet* packet) {
+ }
+ 
+ bool MyMesh::allowPacketForward(const mesh::Packet* packet) {
++#ifdef HYBRID_ALWAYS_REPEAT
++  return true;
++#else
+   return _prefs.isRepeatEn();
++#endif
+ }
+ 
+ void MyMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis) {
+@@ -530,6 +542,33 @@ void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t
+ 
+ void MyMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
+                                const char *text) {
++#ifdef HYBRID_REMOTE_ADMIN
++  ClientInfo* admin = admin_acl.getClient(from.id.pub_key, PUB_KEY_SIZE);
++  if (admin && admin->isAdmin()) {
++    if (sender_timestamp < admin->last_timestamp) {
++      MESH_DEBUG_PRINTLN("Hybrid admin: possible CLI replay attack");
++      return;
++    }
++
++    bool is_retry = sender_timestamp == admin->last_timestamp;
++    admin->last_timestamp = sender_timestamp;
++    admin->last_activity = getRTCClock()->getCurrentTime();
++
++    char command[161];
++    char reply[161];
++    StrHelper::strncpy(command, text, sizeof(command));
++    reply[0] = 0;
++    if (!is_retry) handleAdminCommand(sender_timestamp, command, reply);
++
++    if (reply[0]) {
++      uint32_t response_timestamp = getRTCClock()->getCurrentTimeUnique();
++      if (response_timestamp == sender_timestamp) response_timestamp++;
++      uint32_t est_timeout;
++      sendCommandData(from, response_timestamp, 0, reply, est_timeout);
++    }
++    return;
++  }
++#endif
+   markConnectionActive(from); // in case this is from a server, and we have a connection
+   queueMessage(from, TXT_TYPE_CLI_DATA, pkt, sender_timestamp, NULL, 0, text);
+ }
+@@ -626,6 +665,23 @@ void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *
+ 
+ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
+                                  uint8_t len, uint8_t *reply) {
++#ifdef HYBRID_REMOTE_ADMIN
++  ClientInfo* admin = admin_acl.getClient(contact.id.pub_key, PUB_KEY_SIZE);
++  if (admin && len > 0) {
++    if (sender_timestamp <= admin->last_timestamp) {
++      MESH_DEBUG_PRINTLN("Hybrid admin: possible request replay attack");
++      return 0;
++    }
++
++    uint8_t reply_len = handleAdminRequest(admin, sender_timestamp, data, len);
++    if (reply_len > 0) {
++      admin->last_timestamp = sender_timestamp;
++      admin->last_activity = getRTCClock()->getCurrentTime();
++      memcpy(reply, admin_reply_data, reply_len);
++      return reply_len;
++    }
++  }
++#endif
+   if (data[0] == REQ_TYPE_GET_TELEMETRY_DATA) {
+     uint8_t permissions = 0;
+     uint8_t cp = contact.flags >> 1; // LSB used as 'favourite' bit (so only use upper bits)
+@@ -862,7 +918,11 @@ void MyMesh::onSendTimeout() {}
+ 
+ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui)
+     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
+-      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0) {
++      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0)
++#ifdef HYBRID_REMOTE_ADMIN
++      , admin_regions(admin_key_store), admin_cli(board, rtc, sensors, admin_regions, admin_acl, &_prefs, this)
++#endif
++{
+   _iter_started = false;
+   _cli_rescue = false;
+   offline_queue_len = 0;
+@@ -889,6 +949,20 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
+   _prefs.radio_fem_txgain = 0;
+   //_prefs.rx_delay_base = 10.0f;  enable once new algo fixed
+   _prefs.setRepeatEn(false);
++#ifdef HYBRID_REMOTE_ADMIN
++  _prefs.advert_interval = 30;       // 60 minutes
++  _prefs.flood_advert_interval = 47; // match dedicated repeater default
++  _prefs.tx_delay_factor = 0.5f;
++  _prefs.direct_tx_delay_factor = 0.2f;
++  _prefs.flood_max = 64;
++  _prefs.flood_max_unscoped = 64;
++  _prefs.flood_max_advert = 8;
++  next_local_advert = next_flood_advert = 0;
++  dirty_admin_acl_expiry = 0;
++  last_uptime_millis = 0;
++  uptime_millis = 0;
++  memset(hybrid_neighbours, 0, sizeof(hybrid_neighbours));
++#endif
+ #if defined(USE_SX1262) || defined(USE_SX1268)
+ #ifdef SX126X_RX_BOOSTED_GAIN
+   _prefs.rx_boosted_gain = SX126X_RX_BOOSTED_GAIN;
+@@ -969,6 +1043,31 @@ void MyMesh::begin(bool has_display) {
+ 
+   resetContacts();
+   _store->loadContacts(this);
++#ifdef HYBRID_REMOTE_ADMIN
++  bool prefs_changed = false;
++  if (_prefs.password[0] == 0) {
++    if (_prefs.ble_pin == 0) {
++      _prefs.ble_pin = _active_ble_pin;
++      prefs_changed = true;
++    }
++    snprintf(_prefs.password, sizeof(_prefs.password), "%06u", (unsigned)_prefs.ble_pin);
++    prefs_changed = true;
++  }
++  if (!_prefs.isRepeatEn()) {
++    _prefs.setRepeatEn(true);
++    prefs_changed = true;
++  }
++
++  admin_acl.load(_store->getPrimaryFS(), self_id);
++  for (int i = 0; i < admin_acl.getNumClients(); i++) {
++    seedAdminContact(admin_acl.getClientByIdx(i)->id);
++  }
++  if (prefs_changed) savePrefs();
++
++  // Send prompt adverts after boot, then use the configured periodic timers.
++  next_local_advert = futureMillis(5000);
++  next_flood_advert = futureMillis(15000);
++#endif
+   bootstrapRTCfromContacts();
+   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
+   _store->loadChannels(this);
+@@ -1390,6 +1489,9 @@ void MyMesh::handleCmdFrame(size_t len) {
+     if (len > i) {
+       repeat = cmd_frame[i++];   // FIRMWARE_VER_CODE  9+
+     }
++#ifdef HYBRID_ALWAYS_REPEAT
++    repeat = 1;
++#endif
+ 
+     if (repeat && !isValidClientRepeatFreq(freq)) {
+       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+@@ -2229,6 +2331,26 @@ void MyMesh::checkSerialInterface() {
+ void MyMesh::loop() {
+   BaseChatMesh::loop();
+ 
++#ifdef HYBRID_REMOTE_ADMIN
++  uint32_t now_millis = _ms->getMillis();
++  uptime_millis += (uint32_t)(now_millis - last_uptime_millis);
++  last_uptime_millis = now_millis;
++
++  if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
++    sendSelfAdvertisement(0, true);
++    updateFloodAdvertTimer();
++    updateAdvertTimer();
++  } else if (next_local_advert && millisHasNowPassed(next_local_advert)) {
++    sendSelfAdvertisement(0, false);
++    updateAdvertTimer();
++  }
++
++  if (dirty_admin_acl_expiry && millisHasNowPassed(dirty_admin_acl_expiry)) {
++    saveAdminACL();
++    dirty_admin_acl_expiry = 0;
++  }
++#endif
++
+   if (_cli_rescue) {
+     checkCLIRescueCmd();
+   } else {
+@@ -2263,5 +2385,9 @@ bool MyMesh::advert() {
+ 
+ // To check if there is pending work
+ bool MyMesh::hasPendingWork() const {
+-  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
++  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0
++#ifdef HYBRID_REMOTE_ADMIN
++      || dirty_admin_acl_expiry != 0
++#endif
++      ;
+ }
+diff --git a/examples/companion_radio/MyMesh.h b/examples/companion_radio/MyMesh.h
+index 238adada..4f898cc5 100644
+--- a/examples/companion_radio/MyMesh.h
++++ b/examples/companion_radio/MyMesh.h
+@@ -26,6 +26,13 @@
+ #include "DataStore.h"
+ #include "NodePrefs.h"
+ 
++#ifdef HYBRID_REMOTE_ADMIN
++#include <helpers/ClientACL.h>
++#include <helpers/CommonCLI.h>
++#include <helpers/RegionMap.h>
++#include <helpers/StatsFormatHelper.h>
++#endif
++
+ #include <RTClib.h>
+ #include <helpers/ArduinoHelpers.h>
+ #include <helpers/BaseSerialInterface.h>
+@@ -84,7 +91,38 @@ struct AdvertPath {
+   uint8_t path[MAX_PATH_SIZE];
+ };
+ 
+-class MyMesh : public BaseChatMesh, public DataStoreHost {
++#ifdef HYBRID_REMOTE_ADMIN
++struct HybridRepeaterStats {
++  uint16_t batt_milli_volts;
++  uint16_t curr_tx_queue_len;
++  int16_t noise_floor;
++  int16_t last_rssi;
++  uint32_t n_packets_recv;
++  uint32_t n_packets_sent;
++  uint32_t total_air_time_secs;
++  uint32_t total_up_time_secs;
++  uint32_t n_sent_flood, n_sent_direct;
++  uint32_t n_recv_flood, n_recv_direct;
++  uint16_t err_events;
++  int16_t last_snr;
++  uint16_t n_direct_dups, n_flood_dups;
++  uint32_t total_rx_air_time_secs;
++  uint32_t n_recv_errors;
++};
++
++struct HybridNeighbourInfo {
++  mesh::Identity id;
++  uint32_t advert_timestamp;
++  uint32_t heard_timestamp;
++  int8_t snr;
++};
++#endif
++
++class MyMesh : public BaseChatMesh, public DataStoreHost
++#ifdef HYBRID_REMOTE_ADMIN
++  , public CommonCLICallbacks
++#endif
++{
+ public:
+   MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui=NULL);
+ 
+@@ -103,6 +141,15 @@ public:
+   int  getRecentlyHeard(AdvertPath dest[], int max_num);
+ 
+ protected:
++#ifdef HYBRID_REMOTE_ADMIN
++  // The BLE Companion protocol still reports ADV_TYPE_CHAT. Only LoRa adverts
++  // use the repeater type required by current clients for hop-name/admin UI.
++  uint8_t getSelfAdvertType() const override { return HYBRID_LORA_ADVERT_TYPE; }
++  void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender,
++                      uint8_t* data, size_t len) override;
++  void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
++                    const uint8_t* app_data, size_t app_data_len) override;
++#endif
+   float getAirtimeBudgetFactor() const override;
+   int getInterferenceThreshold() const override;
+   bool getCADEnabled() const override;
+@@ -165,11 +212,15 @@ protected:
+   }
+ 
+ public:
++#ifdef HYBRID_REMOTE_ADMIN
++  void savePrefs() override;
++#else
+   void savePrefs() {
+     _prefs.node_lat = sensors.node_lat;
+     _prefs.node_lon = sensors.node_lon;
+     _store->savePrefs(_prefs);
+   }
++#endif
+ 
+ #if ENV_INCLUDE_GPS == 1
+   void applyGpsPrefs() {
+@@ -182,6 +233,30 @@ public:
+   }
+ #endif
+ 
++#ifdef HYBRID_REMOTE_ADMIN
++  const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
++  const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
++  const char* getRole() override { return "hybrid"; }
++  bool formatFileSystem() override { return false; }
++  void sendSelfAdvertisement(int delay_millis, bool flood) override;
++  void updateAdvertTimer() override;
++  void updateFloodAdvertTimer() override;
++  void setLoggingOn(bool enable) override { }
++  void eraseLogFile() override { }
++  void dumpLogFile() override { }
++  void setTxPower(int8_t power_dbm) override;
++  void formatNeighborsReply(char* reply) override;
++  void removeNeighbor(const uint8_t* pubkey, int key_len) override;
++  void formatStatsReply(char* reply) override;
++  void formatRadioStatsReply(char* reply) override;
++  void formatPacketStatsReply(char* reply) override;
++  mesh::LocalIdentity& getSelfId() override { return self_id; }
++  void saveIdentity(const mesh::LocalIdentity& new_id) override;
++  void clearStats() override;
++  void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) override { }
++  bool setRxBoostedGain(bool enable) override;
++#endif
++
+   // To check if there is pending work
+   bool hasPendingWork() const;
+ 
+@@ -256,6 +331,29 @@ private:
+ 
+   #define ADVERT_PATH_TABLE_SIZE   16
+   AdvertPath advert_paths[ADVERT_PATH_TABLE_SIZE]; // circular table
++
++#ifdef HYBRID_REMOTE_ADMIN
++  void seedAdminContact(const mesh::Identity& id);
++  uint8_t handleAdminLogin(const mesh::Identity& sender, const uint8_t* secret,
++                           uint32_t sender_timestamp, const char* password, bool is_flood);
++  uint8_t handleAdminRequest(ClientInfo* sender, uint32_t sender_timestamp,
++                             const uint8_t* payload, size_t payload_len);
++  void handleAdminCommand(uint32_t sender_timestamp, char* command, char* reply);
++  void putHybridNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
++  bool saveAdminACL();
++
++  ClientACL admin_acl;
++  TransportKeyStore admin_key_store;
++  RegionMap admin_regions;
++  CommonCLI admin_cli;
++  uint8_t admin_reply_data[MAX_PACKET_PAYLOAD];
++  unsigned long next_local_advert;
++  unsigned long next_flood_advert;
++  unsigned long dirty_admin_acl_expiry;
++  uint32_t last_uptime_millis;
++  uint64_t uptime_millis;
++  HybridNeighbourInfo hybrid_neighbours[MAX_NEIGHBOURS];
++#endif
+ };
+ 
+ extern MyMesh the_mesh;
+diff --git a/examples/companion_radio/NodePrefs.h b/examples/companion_radio/NodePrefs.h
+index 21766de8..65a1ab4a 100644
+--- a/examples/companion_radio/NodePrefs.h
++++ b/examples/companion_radio/NodePrefs.h
+@@ -13,6 +13,11 @@ class NodePrefs : public ConfigSerializer {  // persisted to file
+ public:
+   float airtime_factor = 0;
+   char node_name[32];
++#ifdef HYBRID_REMOTE_ADMIN
++  char password[16];
++  char guest_password[16];
++  char owner_info[120];
++#endif
+   double node_lat = 0, node_lon = 0;
+   float freq = 0;
+   uint8_t sf = 0;
+@@ -41,6 +46,35 @@ public:
+   char default_scope_name[31];
+   uint8_t default_scope_key[16];
+ 
++#ifdef HYBRID_REMOTE_ADMIN
++  // Repeater-style remote administration settings. These fields intentionally
++  // match CommonCLI's preference interface so the existing auth/CLI subsystem
++  // can be reused without changing ordinary Companion builds.
++  uint8_t disable_fwd = 1;
++  uint8_t advert_interval = 0;       // minutes / 2
++  uint8_t flood_advert_interval = 0; // hours
++  float tx_delay_factor = 0;
++  float direct_tx_delay_factor = 0;
++  uint8_t allow_read_only = 0;
++  uint8_t flood_max = 0;
++  uint8_t flood_max_unscoped = 0;
++  uint8_t flood_max_advert = 0;
++  uint8_t interference_threshold = 0;
++  uint8_t agc_reset_interval = 0;
++  uint8_t bridge_enabled = 0;
++  uint16_t bridge_delay = 0;
++  uint8_t bridge_pkt_src = 0;
++  uint32_t bridge_baud = 0;
++  uint8_t bridge_channel = 0;
++  char bridge_secret[16];
++  uint8_t powersaving_enabled = 0;
++  uint32_t discovery_mod_timestamp = 0;
++  float adc_multiplier = 0;
++  uint8_t loop_detect = 0;
++  uint8_t cad_enabled = 0;
++  uint8_t extra_sf[4] = {0};
++#endif
++
+ private:
+   class RadioPrefs : public ConfigSerializer {  // COPIED from CommonCLI (for now)
+     NodePrefs* _parent;
+@@ -62,9 +96,13 @@ private:
+       def("tx", _parent->tx_power_dbm);
+       def("af", _parent->airtime_factor);
+       def("rxdelay", _parent->rx_delay_base);
+-      //def("f_txdelay", _parent->tx_delay_factor);   currently hard-coded
+-      //def("d_txdelay", _parent->direct_tx_delay_factor);  currently hard-coded
+-      //def("agc_int", _parent->agc_reset_interval);
++#ifdef HYBRID_REMOTE_ADMIN
++      def("f_txdelay", _parent->tx_delay_factor);
++      def("d_txdelay", _parent->direct_tx_delay_factor);
++      def("agc_int", _parent->agc_reset_interval);
++      def("cad", _parent->cad_enabled);
++      def("int_thr", _parent->interference_threshold);
++#endif
+       def("hash_mode", _parent->path_hash_mode);
+       def("multi_ack", _parent->multi_acks);
+     }
+@@ -87,16 +125,27 @@ private:
+   GPSPrefs gps;
+ 
+   class RepeatPrefs : public ConfigSerializer {  // COPIED from CommonCLI (for now)
+-  public:
+-    uint8_t disable_fwd = 1;
++#ifdef HYBRID_REMOTE_ADMIN
++    NodePrefs* _parent;
++#endif
+   protected:
+     void structure() override {
++#ifdef HYBRID_REMOTE_ADMIN
++      def("disable", _parent->disable_fwd);
++      def("f_max", _parent->flood_max);
++      def("f_max_uns", _parent->flood_max_unscoped);
++      def("f_max_adv", _parent->flood_max_advert);
++      def("loop", _parent->loop_detect);
++#else
+       def("disable", disable_fwd);
+-      //def("f_max", flood_max);
+-      //def("f_max_uns", flood_max_unscoped);
+-      //def("f_max_adv", flood_max_advert);
+-      //def("loop", loop_detect);
++#endif
+     }
++  public:
++#ifdef HYBRID_REMOTE_ADMIN
++    RepeatPrefs(NodePrefs* parent) : _parent(parent) { }
++#else
++    uint8_t disable_fwd = 1;
++#endif
+   };
+   RepeatPrefs repeat;
+ 
+@@ -124,8 +173,13 @@ private:
+ protected:
+   void structure() override {
+     def("name", node_name, sizeof(node_name));
+-    //def("adv_int", advert_interval);
+-    //def("f_adv_int", flood_advert_interval);
++#ifdef HYBRID_REMOTE_ADMIN
++    def("pass", password, sizeof(password));
++    def("guest", guest_password, sizeof(guest_password));
++    def("owner", owner_info, sizeof(owner_info));
++    def("adv_int", advert_interval);
++    def("f_adv_int", flood_advert_interval);
++#endif
+     def("lat", node_lat);
+     def("lon", node_lon);
+     def("radio", radio);
+@@ -134,12 +188,27 @@ protected:
+     def("comp", companion);
+   }
+ public:
++#ifdef HYBRID_REMOTE_ADMIN
++  NodePrefs() : radio(this), gps(this), repeat(this), companion(this) {
++#else
+   NodePrefs() : radio(this), gps(this), companion(this) {
++#endif
+     node_name[0] = 0;
++#ifdef HYBRID_REMOTE_ADMIN
++    password[0] = 0;
++    guest_password[0] = 0;
++    owner_info[0] = 0;
++    bridge_secret[0] = 0;
++#endif
+     default_scope_name[0] = 0;
+     memset(default_scope_key, 0, sizeof(default_scope_key));
+   }
+   // new accessor methods
++#ifdef HYBRID_REMOTE_ADMIN
++  bool isRepeatEn() const { return disable_fwd == 0; }
++  void setRepeatEn(bool en) { disable_fwd = en ? 0 : 1; }
++#else
+   bool isRepeatEn() const { return repeat.disable_fwd == 0; }
+   void setRepeatEn(bool en) { repeat.disable_fwd = en ? 0 : 1; }
++#endif
+ };
+diff --git a/platformio.local.ini b/platformio.local.ini
+new file mode 100644
+index 00000000..c79e681c
+--- /dev/null
++++ b/platformio.local.ini
+@@ -0,0 +1,14 @@
++[env:Tbeam_SX1276_companion_radio_ble_ps]
++extends = env:Tbeam_SX1276_companion_radio_ble
++build_flags =
++  ${env:Tbeam_SX1276_companion_radio_ble.build_flags}
++  '-D FIRMWARE_VERSION="v1.17.1-hybrid"'
++  '-D FIRMWARE_BUILD_DATE="16 Sep 2026"'
++  '-D ALLOWED_REPEAT_FREQ_RANGE={433000,433000},{869495,869495},{869618,869618},{918000,918000}'
++  -D HYBRID_REMOTE_ADMIN=1
++  -D HYBRID_ALWAYS_REPEAT=1
++  -D HYBRID_LORA_ADVERT_TYPE=ADV_TYPE_REPEATER
++  -I examples/companion_radio
++  '-D COMMON_CLI_EXTERNAL_PREFS_HEADER="NodePrefs.h"'
++  -D MAX_CLIENTS=8
++  -D MAX_NEIGHBOURS=32
+diff --git a/src/helpers/BaseChatMesh.cpp b/src/helpers/BaseChatMesh.cpp
+index 972a97e9..03bee74c 100644
+--- a/src/helpers/BaseChatMesh.cpp
++++ b/src/helpers/BaseChatMesh.cpp
+@@ -20,7 +20,8 @@ mesh::Packet* BaseChatMesh::createSelfAdvert(const char* name) {
+   uint8_t app_data[MAX_ADVERT_DATA_SIZE];
+   uint8_t app_data_len;
+   {
+-    AdvertDataBuilder builder(ADV_TYPE_CHAT, name);
++    AdvertDataBuilder builder(getSelfAdvertType(), name);
++    builder.setFeat1(getSelfAdvertFeat1());
+     app_data_len = builder.encodeTo(app_data);
+   }
+ 
+@@ -31,7 +32,8 @@ mesh::Packet* BaseChatMesh::createSelfAdvert(const char* name, double lat, doubl
+   uint8_t app_data[MAX_ADVERT_DATA_SIZE];
+   uint8_t app_data_len;
+   {
+-    AdvertDataBuilder builder(ADV_TYPE_CHAT, name, lat, lon);
++    AdvertDataBuilder builder(getSelfAdvertType(), name, lat, lon);
++    builder.setFeat1(getSelfAdvertFeat1());
+     app_data_len = builder.encodeTo(app_data);
+   }
+ 
+diff --git a/src/helpers/BaseChatMesh.h b/src/helpers/BaseChatMesh.h
+index d9878547..7bd19aab 100644
+--- a/src/helpers/BaseChatMesh.h
++++ b/src/helpers/BaseChatMesh.h
+@@ -94,6 +94,9 @@ protected:
+ 
+   void bootstrapRTCfromContacts();
+ 
++  virtual uint8_t getSelfAdvertType() const { return ADV_TYPE_CHAT; }
++  virtual uint16_t getSelfAdvertFeat1() const { return 0; }
++
+   void resetContacts() {
+     memset(contacts, 0, sizeof(contacts[0])*MAX_ANON_CONTACTS);   // set all to have type = ADV_TYPE_NONE(0)
+     num_contacts = MAX_ANON_CONTACTS;  // seed the first contacts for anon requests
+diff --git a/src/helpers/CommonCLI.h b/src/helpers/CommonCLI.h
+index 237c758e..0a35fcbd 100644
+--- a/src/helpers/CommonCLI.h
++++ b/src/helpers/CommonCLI.h
+@@ -20,6 +20,9 @@
+ #define LOOP_DETECT_MODERATE  2
+ #define LOOP_DETECT_STRICT    3
+ 
++#ifdef COMMON_CLI_EXTERNAL_PREFS_HEADER
++#include COMMON_CLI_EXTERNAL_PREFS_HEADER
++#else
+ class NodePrefs : public ConfigSerializer {
+ public:
+   // in-memory backing data
+@@ -193,6 +196,7 @@ public:
+     owner_info[0] = 0;
+   }
+ };
++#endif
+ 
+ class CommonCLICallbacks {
+ public:

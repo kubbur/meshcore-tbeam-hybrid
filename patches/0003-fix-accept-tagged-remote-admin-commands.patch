@@ -1,0 +1,46 @@
+From 5ba0a1b12d0bd4988d4661143b4a0f0a00d027b0 Mon Sep 17 00:00:00 2001
+From: kubbur <kubbur@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 16:51:22 +0000
+Subject: [PATCH 3/3] fix: accept tagged remote admin commands
+
+---
+ examples/companion_radio/HybridRemoteAdmin.cpp | 12 ++++++++++++
+ platformio.local.ini                           |  2 +-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/examples/companion_radio/HybridRemoteAdmin.cpp b/examples/companion_radio/HybridRemoteAdmin.cpp
+index ca1fa2e1..1ea20119 100644
+--- a/examples/companion_radio/HybridRemoteAdmin.cpp
++++ b/examples/companion_radio/HybridRemoteAdmin.cpp
+@@ -225,6 +225,18 @@ uint8_t MyMesh::handleAdminRequest(ClientInfo* sender, uint32_t sender_timestamp
+ }
+ 
+ void MyMesh::handleAdminCommand(uint32_t sender_timestamp, char* command, char* reply) {
++  while (*command == ' ') command++;  // match the stock repeater CLI
++
++  // Companion apps may prefix remote commands with a short request tag (for
++  // example, "01|get radio") so asynchronous replies can be correlated. The
++  // stock repeater strips the tag before dispatch and reflects it in the
++  // reply. Preserve that wire behaviour for MeshCore One compatibility.
++  if (strlen(command) > 4 && command[2] == '|') {
++    memcpy(reply, command, 3);
++    reply += 3;
++    command += 3;
++  }
++
+   if (memcmp(command, "setperm ", 8) == 0) {
+     char* hex = &command[8];
+     char* separator = strchr(hex, ' ');
+diff --git a/platformio.local.ini b/platformio.local.ini
+index bf97b2c8..79931f81 100644
+--- a/platformio.local.ini
++++ b/platformio.local.ini
+@@ -4,7 +4,7 @@ extends = env:Tbeam_SX1276_companion_radio_ble
+ platform_packages = platformio/framework-arduinoespressif32@https://github.com/IoTThinks/powersaving-arduino-lib/releases/download/2.0.17/esp32-2.0.17.zip
+ build_flags =
+   ${env:Tbeam_SX1276_companion_radio_ble.build_flags}
+-  '-D FIRMWARE_VERSION="v1.17.1-hybrid-ps"'
++  '-D FIRMWARE_VERSION="v1.17.1-hybrid-ps2"'
+   '-D FIRMWARE_BUILD_DATE="16 Sep 2026"'
+   '-D ALLOWED_REPEAT_FREQ_RANGE={433000,433000},{869495,869495},{869618,869618},{918000,918000}'
+   -D HYBRID_REMOTE_ADMIN=1

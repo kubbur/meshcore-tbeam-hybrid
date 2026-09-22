@@ -4,7 +4,23 @@ Experimental, unofficial MeshCore firmware for one specific board family. It kee
 
 This repository is not affiliated with or endorsed by the MeshCore project.
 
-## What works
+## Current prerelease: ps3-rc2
+
+[Download v1.17.1-hybrid-ps3-rc2](https://github.com/kubbur/meshcore-tbeam-hybrid/releases/tag/v1.17.1-hybrid-ps3-rc2). The exact downloadable application was flashed, readback-verified and boot-checked on one T-Beam on 2026-09-22 (UTC). It is an experimental release, not a battery-life or charging-safety certification.
+
+Changes since ps2:
+
+- Guarded **1 A battery-charge target**, with separate saved 500/1500 mA USB input profiles.
+- Corrected charging recovery: remove the separate 4.75 V recovery gate while keeping the 4.5 V low-input backoff, temperature/hardware checks and 60-second recovery delay.
+- Real GPS power-rail/UART control when GPS is disabled, plus stale-fix rejection.
+- Incoming messages no longer wake the OLED or extend its timeout; manual button wake remains.
+- Improved idle handling, retaining the PowerSaving17 framework and always-available forwarding, including while connected through BLE.
+- Explicit MCU/PMU temperature diagnostics; no misleading ambient/battery temperature claim.
+- Corrected Remote Management's repeater switch response. Forwarding stays locked on; `get repeat` now returns the standard `> on` value.
+
+**Actual charging current and battery-life gains have not been measured.** The firmware does not measure battery temperature. Deep sleep remains disabled/unvalidated. Read [Power settings and limitations](docs/POWER.md) before changing USB input limits.
+
+## Hybrid capabilities
 
 - Normal BLE Companion messaging with a single node identity
 - Persistent forwarding using MeshCore's Companion Repeat path
@@ -46,7 +62,7 @@ With Git and PlatformIO installed:
 bash scripts/build.sh
 ```
 
-The script clones the exact upstream revision into `work/MeshCore`, applies the three patches and builds the power-saving target. Build outputs are created under:
+The script clones the exact upstream revision into `work/MeshCore`, checks and applies all seven patches, verifies the resulting source tree and builds the power-saving target. It refuses to replace an existing source directory and never flashes a device. Build outputs are created under:
 
 ```text
 work/MeshCore/.pio/build/Tbeam_SX1276_companion_radio_ble_ps/
@@ -57,16 +73,18 @@ See [Flashing](docs/FLASHING.md) before writing a device.
 ## Firmware identity
 
 ```text
-v1.17.1-hybrid-ps2
+v1.17.1-hybrid-ps3-rc2
 ```
 
-The hardware-validated application image had SHA256:
+The application-only release asset (1,526,336 bytes), verified on the device at offset `0x10000`, has SHA256:
 
 ```text
-aade3f34c72159074c11bd06c4ddc24035183d309df03fccd4096e6cd7fe5517
+ef7725e68dadc125b196ecadb5a49e0c5e493daaafd04525a07d49f45c5491ad
 ```
 
-That binary is intentionally not committed: its compiler diagnostics contained a local build path. Build locally from the reviewed source and patches.
+The binary, build record and checksum file are release assets, not source files in Git. The seven patches reconstruct source tree `6649a527e348645a32b41905d181dc1e62794c9f`, matching the clean build input byte-for-byte for tracked files. Different dependency/toolchain versions or build paths can produce different binary bytes; a local build is not required to have the published hash.
+
+The previous [ps2 release](https://github.com/kubbur/meshcore-tbeam-hybrid/releases/tag/v1.17.1-hybrid-ps2) remains available. Its public clean binary is distinct from the older ps2 hardware-test image recorded in the historical validation notes.
 
 ## Architecture
 
@@ -82,7 +100,7 @@ See [Architecture and limitations](docs/ARCHITECTURE.md) for details.
 
 ## Validation
 
-The exact T-Beam above was exercised with real LoRa traffic and MeshCore One. BLE Companion messaging, packet forwarding, named hop attribution, remote login, telemetry, settings and tagged CLI commands passed. See [Validation](docs/VALIDATION.md).
+The earlier ps2 hybrid was exercised with real LoRa traffic and MeshCore One. For ps3-rc2, clean hybrid/ordinary Companion builds, simulated-hardware tests and a real client-parser test passed; the exact release image passed app readback and a 40-second boot check. The owner subsequently reported that it looked good. Detailed rc2 RF, GUI, GPS, measured charging and battery-life acceptance has not been separately recorded. See [Validation](docs/VALIDATION.md) for the evidence boundary.
 
 ## Security and privacy
 

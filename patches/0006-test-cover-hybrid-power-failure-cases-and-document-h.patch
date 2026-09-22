@@ -1,0 +1,543 @@
+From 1f3a0eecccc2a8385205a70693764bd00916516a Mon Sep 17 00:00:00 2001
+From: kubbur <kubbur@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 17:14:53 +0000
+Subject: [PATCH 6/7] test: cover hybrid power failure cases and document
+ hardware gates
+
+---
+ docs/tbeam-deep-sleep-investigation.md        |  23 +++
+ docs/tbeam-hybrid-ps3.md                      |  81 +++++++++++
+ tests/hybrid_power/display_test.cpp           |  40 ++++++
+ tests/hybrid_power/gps_test.cpp               |  30 ++++
+ .../mocks/LilygoTBeamSX1276Board.h            |  10 ++
+ .../sensors/MicroNMEALocationProvider.h       |  32 +++++
+ tests/hybrid_power/pmu_test.cpp               | 131 ++++++++++++++++++
+ tests/hybrid_power/policy_test.cpp            |  54 ++++++++
+ tests/hybrid_power/run.py                     |  59 ++++++++
+ 9 files changed, 460 insertions(+)
+ create mode 100644 docs/tbeam-deep-sleep-investigation.md
+ create mode 100644 docs/tbeam-hybrid-ps3.md
+ create mode 100644 tests/hybrid_power/display_test.cpp
+ create mode 100644 tests/hybrid_power/gps_test.cpp
+ create mode 100644 tests/hybrid_power/mocks/LilygoTBeamSX1276Board.h
+ create mode 100644 tests/hybrid_power/mocks/helpers/sensors/MicroNMEALocationProvider.h
+ create mode 100644 tests/hybrid_power/pmu_test.cpp
+ create mode 100644 tests/hybrid_power/policy_test.cpp
+ create mode 100644 tests/hybrid_power/run.py
+
+diff --git a/docs/tbeam-deep-sleep-investigation.md b/docs/tbeam-deep-sleep-investigation.md
+new file mode 100644
+index 00000000..e0eddbd0
+--- /dev/null
++++ b/docs/tbeam-deep-sleep-investigation.md
+@@ -0,0 +1,23 @@
++# SX1276 receive-triggered deep sleep: investigation, not enabled
++
++Inspected against the ps2 source plus ps3 changes, RadioLib commit `6d8934836678d8894e3d556550475b37dce3e2b6`, classic ESP32/AXP2101 T-Beam.
++
++## Hardware concept is possible
++
++An externally powered SX1276 can remain in continuous receive while the ESP32 sleeps. Receive-done is DIO0, wired to ESP32 GPIO26 on this target; GPIO26 supports RTC wake. The [ESP-IDF sleep documentation](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32/api-reference/system/sleep_modes.html) distinguishes retained RTC memory from ordinary RAM and BLE connectivity lost in deep sleep. The [SX1276 datasheet](https://cdn-shop.adafruit.com/product-files/3179/sx1276_77_78_79.pdf) describes the finite 256-byte FIFO and continuous-RX packet metadata. Waking is not equivalent to preserving and forwarding the triggering packet.
++
++## Concrete blockers in this checkout
++
++- `TBeamBoard::enterDeepSleep` and `begin` use DIO1/GPIO33 rather than the SX1276 RX DIO0/GPIO26. `LilygoTBeamSX1276Board::getIRQGpio()` is correctly overridden for ordinary light-sleep use, but the deep helper bypasses it.
++- That helper applies RTC hold to chip-select GPIO18, which is not an RTC GPIO on classic ESP32. Combining the normally-high active-low button with an `ANY_HIGH` radio wake mask would also risk immediate wake. A dedicated entry/wake design is required.
++- Normal setup calls `radio_init()` and then `radio_driver.getRngSeed()` before `the_mesh.begin()`. RadioLib `SX127x::begin()` calls `findChip()`, whose loop **resets the radio**. Random-byte collection changes the radio mode. The partial `BD_STARTUP_RX_PACKET` branch in `RadioLibWrapper::begin()` only sets an interrupt flag; it does not bypass these destructive startup steps.
++- This target's offline Companion queue is **128 × (1 + 176) = 22,656 bytes**, already larger than the ESP32's RTC memory budget before duplicate hashes, clocks, routing/adverts, admin sessions/replay state and stack state are counted. The duplicate cache has 160 entries and is normally cleared by its constructor. Ordinary app boot cannot preserve the required state.
++- BLE must remain connected for MeshMapper's packet feed. Deep sleep cannot satisfy that active-session requirement. Never use a BLE connection as a reason to disable repeating.
++
++## Gate for a future isolated prototype
++
++Implement a wake entry before normal radio initialization, snapshot IRQ/FIFO/RSSI/SNR and validate CRC/packet boundaries, then restore routing/timers/admin replay/duplicate state before accepting the captured packet. Forbid sleep with any unpreserved offline message or pending work; define a bounded retained-state schema rather than writing flash per packet. Retain scheduled advert/timer wake and handle radio-high entry races and button polarity correctly. Keep ALDO2 and appropriate SPI pin state while preventing unintended GPS/display boot activity.
++
++Test the **same packet** causing wake through to a receiving node, followed by bursts, duplicates, replay attempts, unread message delivery and authenticated management. Measure wake latency and net energy. Only then consider opt-in deployment. State-preserving light sleep would be a separate design and must not be described as working deep sleep; classic Bluetooth power locks still need measuring on this framework.
++
++Outcome for rc1: no new deep-sleep entry call, no changes to radio startup/packet queues and no automatic deep sleep. Host policy tests and a firmware build cannot clear this hardware gate. No USB T-Beam was present during implementation, so an on-device wake prototype was not exercised.
+diff --git a/docs/tbeam-hybrid-ps3.md b/docs/tbeam-hybrid-ps3.md
+new file mode 100644
+index 00000000..36c66155
+--- /dev/null
++++ b/docs/tbeam-hybrid-ps3.md
+@@ -0,0 +1,81 @@
++# T-Beam hybrid ps3 test firmware
++
++Target: classic T-Beam V1.2, SX1276, AXP2101, 4 MB ESP32; `Tbeam_SX1276_companion_radio_ble_ps`. Version: `v1.17.1-hybrid-ps3-rc1`. This is a hardware-test candidate, not a battery-life-validated release.
++
++## Implemented
++
++- Preserve the ps2 single identity: BLE Companion/CHAT, REPEATER LoRa adverts, authenticated tagged remote CLI, always-on repeating including while BLE is connected, and the 869.618 MHz allowance. No radio-power reduction or framework upgrade.
++- Set the supported charge target to **1000 mA**, retaining 4.2 V. Verify PMU writes/readback and ADC setup. A fresh install separately limits USB input to **500 mA**; explicitly select **1500 mA input** on a suitable supply to provide headroom for both charging and the running board. The firmware cannot recognise the adapter. A selected input profile persists, so choose 500 before returning to an unknown/weak USB source.
++- Sample PMU state every five seconds. Reduce the requested charge limit to 500 mA on PMU-die temperature at least 80 C, hardware limiting, or VBUS below 4.5 V. Require at most 70 C, at least 4.75 V and sixty seconds of healthy samples to restore 1 A. Failed samples request a 0 mA **constant-current** limit; a wrong/unverified charge voltage is latched conservative until restart. These are software requests, not proof of measured current or complete charger isolation. Failed I2C writes cannot guarantee a change and are reported as errors.
++- Do not change hardware thermal thresholds, termination or safety-timer configuration. Read raw protection registers on demand. The existing board configuration has TS measurement disabled; **there is no battery-temperature protection supplied by this change**. PMU temperature is not cell temperature. Charging hardware can remain active when application supervision stops. Cell/enclosure testing is still required.
++- GPS off shuts down its UART, releases UART pins to input, and disables ALDO3 with readback. ALDO2 (radio) and GPS backup supply are not switched. Saved GPS enable/disable preferences remain in the existing format; no new GPS-on default. GPS-off startup avoids the old cold-start detection pulse. The GPS setting remains available for this known onboard-GPS target.
++- Ignore stale/undated fixes; fresh GPS telemetry requires a currently enabled receiver and a fix updated within ten seconds. Fixed node/advert coordinates are still a separate saved feature and may remain the last location; do not treat those as a live fix.
++- Incoming messages update previews/unread counts but neither wake the OLED nor extend its timeout. Existing manual button wake and approximately fifteen-second timeout remain. The driver already uses display-off, not a black frame.
++- Allow bounded task waits while contact/ACL saves are deferred; preserve immediate work, BLE read handling and TX queues. BLE pacing uses a one-millisecond wait. Keep existing CPU scaling and Bluetooth sleep setup; yields/lock profiling do not prove light-sleep residency.
++- Average MCU temperatures as floats rather than unsigned integers. Omit the unqualified internal-temperature channel from hybrid telemetry. Explicit diagnostics distinguish uncalibrated MCU die, PMU die and unavailable battery/ambient temperatures. This is not a calibrated ambient-temperature sensor.
++
++Charge/input encodings follow the [AXP2101 register table, page 38](https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/docs/products/core/Core2%20v1.1/axp2101.pdf); current settings are not actual measured current.
++
++## Commands
++
++Use the existing authenticated LoRa Management CLI from the Wio/other Companion. Correlation tags are retained. No new password, public login or identity is introduced.
++
++```text
++ver
++get repeat
++get radio
++get power
++get charge
++get protections
++get temps
++get rails
++get gps
++get idle
++get sleep
++```
++
++`get power` shows VBUS, battery/system mV, current-direction and charger-phase codes, and sample age. Direction: 0 standby, 1 charging, 2 discharging. Other diagnostic readings use the same five-second snapshot; `get protections` reads on demand. `get charge` distinguishes the requested profile, register limit, USB input limit, requested backoff and last write result. Neither is an ammeter.
++
++On the user's rated 5 V/3 A car supply, enable input headroom:
++
++```text
++set usb limit 1500
++get charge
++```
++
++Before plugging into a weaker/unknown source:
++
++```text
++set usb limit 500
++```
++
++Only these two input settings are accepted. The new NVS namespace `hybrid_ps3` stores only `usb_ma` when explicitly changed; existing node preferences and identity/contacts/channels formats are unchanged. There is no 700 mA staging step. Actual charging can be below 1 A due to input limits, protection or taper.
++
++The same diagnostic commands work in the existing USB rescue console. Enter rescue with the existing long-button action during the first eight seconds after boot; it is not the binary Companion USB protocol. `get pm locks` is USB-only and prints the framework's power-management lock profile. It does not measure sleep residency. Exiting rescue requires the existing reboot command; do not claim the normal BLE workflow has been tested by entering rescue.
++
++## MeshMapper + Wio workflow
++
++MeshMapper connects directly to this T-Beam; the messaging app uses the Wio L1. [MeshMapper's connection guide](https://wiki.meshmapper.net/app_connection_guide/) says its location lock is taken from the phone. The T-Beam GPS can therefore stay disabled for that workflow. The raw packet/RSSI/SNR feed and BLE Companion handshake remain unchanged, and forwarding is not conditional on BLE disconnection. Actual simultaneous mapping and third-party forwarding still need on-air testing.
++
++MeshMapper may rename the node in anonymous mode and adjust channels, scope or path-hash settings. Use a clean disconnect for documented restoration of temporary name/path-hash changes. No firmware change here attempts to override the user's app session.
++
++## Deliberately not enabled / still pending
++
++- Automatic deep sleep: **off**. See `tbeam-deep-sleep-investigation.md`; the current startup path resets the radio and ordinary RAM cannot preserve the entire offline message queue. No wake-on-radio success is claimed.
++- Periodic GPS acquisition policy: not added in rc1. First validate real rail-off/restart on hardware. Continuous GPS remains available when enabled; MeshMapper does not need it for phone-GPS mapping. `gps_interval` remains a coordinate-update interval, not a power-duty-cycle setting.
++- Measured idle/sleep residency, actual 1 A charge current, short-trip energy balance, cold/hot cell behaviour, runtime BLE/RF compatibility and reboot persistence: hardware acceptance pending. Do not claim quantified battery-life gains from a clean build.
++
++## Local software verification
++
++Run `python3 tests/hybrid_power/run.py` after dependencies have been populated for the ps target. Tests execute production policy/GPS code and extracted production display/PMU methods with simulated hardware. They cover temperature validation, timer wrap, save deadlines, BLE pacing, display bursts/manual wake, GPS lifecycle/freshness, PMU read/short-read/write/readback faults, recovery hysteresis, voltage fault latching and NVS failure. Structural checks guard always-repeat and the mapping feed; they are not RF tests.
++
++Build both `Tbeam_SX1276_companion_radio_ble_ps` and the ordinary `Tbeam_SX1276_companion_radio_ble` regression. Do not flash the ordinary regression binary. The new board-specific behaviour is compiled only under `TBEAM_HYBRID_POWER_V3`; the shared float-temperature correction/default temperature hook are the intentional shared changes.
++
++## Hardware acceptance before release
++
++1. App-only flash to `0x10000`, after reading the installed partition map/boot selection. Preserve NVS, filesystem, identity, contacts, channels, ACL and radio preferences. Do not use a merged image or erase the device. Existing backups are retained; the user skipped a new backup/baseline stage.
++2. Capture the ps3 version, successful SX1276/PMU/Bluetooth/power-management initialization and no crash-loop evidence. Then test BLE messaging/reconnect and authenticated admin; a boot log alone does not prove RF performance.
++3. GPS off/on/off, button wake/timeout, message burst with screen off, admin temperature labels, charge/protection readback, saved settings after a real reboot.
++4. Send a third-party message through the T-Beam with MeshMapper connected, confirm receipt and named path on another node. Repeat after disconnect; collect genuine mapping samples with phone GPS. Do not mistake self-transmission for forwarding.
++5. Supervised charging on the known supply with the cell's specified charging-temperature range checked, actual current/voltage/cell/enclosure temperature measured, and stop on abnormal heating, resets or voltage sag. Validate persistence after a real restart and renewed tests. PMU die temperature cannot substitute for cell temperature.
++6. Only after acceptance consider publishing. No automatic update or public release is included in this change.
+diff --git a/tests/hybrid_power/display_test.cpp b/tests/hybrid_power/display_test.cpp
+new file mode 100644
+index 00000000..264cc635
+--- /dev/null
++++ b/tests/hybrid_power/display_test.cpp
+@@ -0,0 +1,40 @@
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++uint32_t nowMs = 100;
++uint32_t millis() { return nowMs; }
++constexpr uint32_t AUTO_OFF_MILLIS = 15000;
++struct Display { bool on = false; int wakes = 0; bool isOn() { return on; } void turnOn() { on = true; ++wakes; } };
++struct MsgPreviewScreen { int count = 0; void addPreview(uint8_t, const char*, const char*) { ++count; } };
++struct UITask {
++  Display* _display;
++  MsgPreviewScreen* msg_preview;
++  int _msgcount = 0;
++  bool connected = false;
++  uint32_t _auto_off = 0, _next_refresh = 0;
++  bool hasConnection() { return connected; }
++  void setCurrScreen(MsgPreviewScreen*) { _next_refresh = 100; }
++  void newMsg(uint8_t, const char*, const char*, int);
++  char checkDisplayOn(char);
++};
++// Extracted unchanged from production UITask.cpp by the runner, not a copy of
++// its logic. Both the hybrid and ordinary preprocessor branches are exercised.
++#include "display_methods.inc"
++int main() {
++  Display display; MsgPreviewScreen preview; UITask ui{&display, &preview};
++  ui.newMsg(1, "peer", "hello", 1);
++#ifdef TBEAM_HYBRID_POWER_V3
++  assert(!display.on && display.wakes == 0 && ui._auto_off == 0);
++  assert(ui.checkDisplayOn('x') == 0 && display.on && ui._auto_off == 15100);
++  uint32_t deadline = ui._auto_off;
++  for (int i = 0; i < 100; ++i) { ++nowMs; ui.newMsg(1, "peer", "burst", 2 + i); }
++  assert(ui._auto_off == deadline && display.wakes == 1);
++  display.on = false; ui.connected = true;
++  ui.newMsg(1, "peer", "BLE", 102); assert(!display.on && display.wakes == 1);
++  assert(ui._msgcount == 102 && preview.count == 102);
++  puts("PASS: message bursts cannot wake OLED or extend timeout; button still wakes; unread state retained");
++#else
++  assert(display.on && display.wakes == 1 && ui._auto_off == 15100);
++  puts("PASS: ordinary Companion message-wake behavior unchanged");
++#endif
++}
+diff --git a/tests/hybrid_power/gps_test.cpp b/tests/hybrid_power/gps_test.cpp
+new file mode 100644
+index 00000000..ab035225
+--- /dev/null
++++ b/tests/hybrid_power/gps_test.cpp
+@@ -0,0 +1,30 @@
++#include <cassert>
++#include <cstring>
++#include <TBeamGpsProvider.h>
++int main() {
++  LilygoTBeamSX1276Board board;
++  TBeamGpsProvider gps(board, nullptr);
++  assert(!gps.isEnabled() && !gps.isValid());
++  gps.stop(); gps.stop(); assert(gps.claims == 0 && !board.powered);
++  gps.sendSentence("ignored"); assert(gps.sentences == 0);
++  board.failEnable = true;
++  gps.begin(); assert(!gps.isEnabled() && !board.powered && Serial1.starts == 0);
++  board.failEnable = false;
++  gps.begin(); gps.begin();
++  assert(gps.isEnabled() && board.powered && gps.claims == 1 && Serial1.starts == 1);
++  assert(Serial1.rx == 34 && Serial1.tx == 12);
++  gps.sendSentence("test"); assert(gps.sentences == 1);
++  gps.parserValid = true; gps.epoch = 946684800L; gps.loop(); assert(!gps.isValid());
++  gps.epoch = 1790080000L; nowMs = 100; gps.loop(); assert(gps.isValid());
++  nowMs = 10101; gps.loop(); assert(!gps.isValid()); // Parser still valid, but no NEW fix.
++  char reply[140]; gps.formatStatus(reply, sizeof(reply)); assert(strstr(reply, "stale"));
++  ++gps.epoch; gps.loop(); assert(gps.isValid());
++  gps.stop(); assert(!gps.isValid() && !gps.isEnabled() && !board.powered && gps.claims == 0);
++  assert(pinModes[12] == INPUT && pinModes[34] == INPUT);
++  int loops = gps.loops; gps.loop(); assert(gps.loops == loops);
++  gps.begin(); assert(!gps.isValid());
++  gps.parserValid = true; ++gps.epoch; nowMs = 0xFFFFFFF0u; gps.loop();
++  nowMs = 16; assert(gps.isValid());
++  nowMs = 10001; assert(!gps.isValid());
++  puts("PASS: actual GPS provider lifecycle, failed enable, UART pins, stale fixes, timer wrap");
++}
+diff --git a/tests/hybrid_power/mocks/LilygoTBeamSX1276Board.h b/tests/hybrid_power/mocks/LilygoTBeamSX1276Board.h
+new file mode 100644
+index 00000000..301f9a35
+--- /dev/null
++++ b/tests/hybrid_power/mocks/LilygoTBeamSX1276Board.h
+@@ -0,0 +1,10 @@
++#pragma once
++struct LilygoTBeamSX1276Board {
++  bool powered = false, failEnable = false;
++  int enabled = 0, disabled = 0;
++  bool setGpsPower(bool on) {
++    if (on) ++enabled; else ++disabled;
++    powered = on;
++    return !(on && failEnable);
++  }
++};
+diff --git a/tests/hybrid_power/mocks/helpers/sensors/MicroNMEALocationProvider.h b/tests/hybrid_power/mocks/helpers/sensors/MicroNMEALocationProvider.h
+new file mode 100644
+index 00000000..f697ff5f
+--- /dev/null
++++ b/tests/hybrid_power/mocks/helpers/sensors/MicroNMEALocationProvider.h
+@@ -0,0 +1,32 @@
++#pragma once
++#include <cstdint>
++#include <cstdio>
++inline uint32_t nowMs = 0;
++inline uint32_t millis() { return nowMs; }
++constexpr int PIN_GPS_TX = 34, PIN_GPS_RX = 12, INPUT = 0, SERIAL_8N1 = 0;
++inline int pinModes[40] = {};
++inline void pinMode(int pin, int mode) { pinModes[pin] = mode; }
++struct FakeSerial {
++  int starts = 0, stops = 0, rx = -1, tx = -1;
++  void end() { ++stops; }
++  void begin(uint32_t, int, int r, int t) { ++starts; rx = r; tx = t; }
++};
++inline FakeSerial Serial1;
++namespace mesh { class RTCClock {}; }
++class MicroNMEALocationProvider {
++public:
++  int claims = 0, sentences = 0, loops = 0;
++  bool parserValid = false;
++  long epoch = 0;
++  MicroNMEALocationProvider(FakeSerial&, mesh::RTCClock*) {}
++  virtual ~MicroNMEALocationProvider() = default;
++  virtual void begin() { ++claims; }
++  virtual void stop() { --claims; }
++  virtual void syncTime() { parserValid = false; }
++  virtual bool isEnabled() { return true; }
++  virtual bool isValid() { return parserValid; }
++  virtual void loop() { ++loops; }
++  virtual long getTimestamp() { return epoch; }
++  virtual long satellitesCount() { return parserValid ? 8 : 0; }
++  virtual void sendSentence(const char*) { ++sentences; }
++};
+diff --git a/tests/hybrid_power/pmu_test.cpp b/tests/hybrid_power/pmu_test.cpp
+new file mode 100644
+index 00000000..87ab18fe
+--- /dev/null
++++ b/tests/hybrid_power/pmu_test.cpp
+@@ -0,0 +1,131 @@
++#include <array>
++#include <cassert>
++#include <cstdio>
++#include <cstring>
++#include <helpers/PowerSavingUtils.h>
++#include <XPowersParams.hpp>
++#include <REG/AXP2101Constants.h>
++uint32_t nowMs = 0;
++uint32_t millis() { return nowMs; }
++unsigned getCpuFrequencyMhz() { return 80; }
++constexpr int XPOWERS_AXP2101 = 1, XPOWERS_ALDO3 = 3, I2C_PMU_ADD = 0x34;
++struct WireMock {
++  std::array<uint8_t, 256> regs{};
++  int reg = 0, pos = 0, remaining = 0, failReg = -1, shortReg = -1;
++  void beginTransmission(uint8_t) {}
++  void write(uint8_t value) { reg = value; }
++  int endTransmission(bool) { return reg == failReg ? 1 : 0; }
++  size_t requestFrom(uint8_t, size_t count) {
++    pos = reg; remaining = int(count) - (reg == shortReg ? 1 : 0); return remaining;
++  }
++  int available() { return remaining; }
++  uint8_t read() { --remaining; return regs[pos++]; }
++} PMU_WIRE_PORT;
++struct FakePMU {
++  int model = XPOWERS_AXP2101, chargeWrites = 0, gpsWrites = 0;
++  bool writeOk = true, discardChargeWrite = false;
++  int getChipModel() { return model; }
++  bool setChargerConstantCurr(uint8_t code) {
++    ++chargeWrites;
++    if (!writeOk || code > 16) return false;
++    if (!discardChargeWrite) PMU_WIRE_PORT.regs[XPOWERS_AXP2101_ICC_CHG_SET] = code;
++    return true;
++  }
++  bool setVbusCurrentLimit(uint8_t code) {
++    if (!writeOk) return false;
++    PMU_WIRE_PORT.regs[XPOWERS_AXP2101_INPUT_CUR_LIMIT_CTRL] = code; return true;
++  }
++  bool enableTemperatureMeasure() {
++    if (!writeOk) return false;
++    PMU_WIRE_PORT.regs[XPOWERS_AXP2101_ADC_CHANNEL_CTRL] |= 0x10; return true;
++  }
++  bool enablePowerOutput(uint8_t channel) {
++    assert(channel == XPOWERS_ALDO3); ++gpsWrites;
++    if (writeOk) PMU_WIRE_PORT.regs[XPOWERS_AXP2101_LDO_ONOFF_CTRL0] |= 4;
++    return writeOk;
++  }
++  bool disablePowerOutput(uint8_t channel) {
++    assert(channel == XPOWERS_ALDO3); ++gpsWrites;
++    if (writeOk) PMU_WIRE_PORT.regs[XPOWERS_AXP2101_LDO_ONOFF_CTRL0] &= ~4;
++    return writeOk;
++  }
++};
++struct Preferences {
++  static inline bool openOk = true, savedOk = true;
++  static inline uint16_t value = 500;
++  bool begin(const char* name, bool) { assert(strcmp(name, "hybrid_ps3") == 0); return openOk; }
++  uint16_t getUShort(const char*, uint16_t) { return value; }
++  size_t putUShort(const char*, uint16_t v) { if (savedOk) value = v; return savedOk ? 2 : 0; }
++  void end() {}
++};
++struct SerialMock { void println(const char*) {} template<class... T> void printf(const char*, T...) {} } Serial;
++struct FakeBase {
++  float getMCUTemperature() { return 48.4f; }
++  virtual float getTelemetryTemperature() { return 0; }
++  virtual bool isExternalPowered() { return false; }
++};
++// Board state declarations and complete method bodies extracted unchanged by
++// the runner. Only I2C/PMU/NVS/clock interfaces are replaced with fake devices.
++#include "power_board.inc"
++#include "power_methods.inc"
++
++void adc(uint8_t reg, uint16_t value) { PMU_WIRE_PORT.regs[reg] = value >> 8; PMU_WIRE_PORT.regs[reg + 1] = value; }
++void healthy() {
++  PMU_WIRE_PORT = WireMock{}; nowMs = 0;
++  Preferences::openOk = Preferences::savedOk = true; Preferences::value = 500;
++  auto& r = PMU_WIRE_PORT.regs;
++  r[XPOWERS_AXP2101_STATUS1] = 0x28; // Valid VBUS + battery.
++  r[XPOWERS_AXP2101_STATUS2] = 0x23;
++  r[XPOWERS_AXP2101_ADC_CHANNEL_CTRL] = 0x1D;
++  r[XPOWERS_AXP2101_CV_CHG_VOL_SET] = XPOWERS_AXP2101_CHG_VOL_4V2;
++  r[XPOWERS_AXP2101_LDO_ONOFF_CTRL0] = 2; // Radio on, GPS off.
++  adc(0x34, 3700); adc(0x38, 5000); adc(0x3A, 4200); adc(0x3C, 6914); // PMU 40 C.
++}
++int main() {
++  healthy(); FakePMU pmu; TBeamBoard board; board.PMU = &pmu;
++  board.beginPowerV3();
++  assert(board._powerConfigOk && board.samplePower());
++  assert(board._power.battMv == 3700 && board._power.vbusMv == 5000);
++  assert(board._power.pmuTemperature == 40.0f && board._power.chargeCode == 16 && board._power.inputCode == 1);
++  assert(isnan(board.getTelemetryTemperature()));
++  PMU_WIRE_PORT.regs[0x34] |= 0x20; assert(board.samplePower() && board._power.battMv == 3700);
++  assert(board.setGpsPower(true) && (PMU_WIRE_PORT.regs[0x90] & 6) == 6);
++  assert(board.setGpsPower(false) && PMU_WIRE_PORT.regs[0x90] == 2); // Radio untouched.
++  PMU_WIRE_PORT.failReg = 0x16; nowMs = 2000; board.loopPowerV3();
++  assert(!board._power.valid && PMU_WIRE_PORT.regs[0x62] == 0 && board._chargeLimited);
++  PMU_WIRE_PORT.failReg = -1; nowMs += 5000; board.loopPowerV3();
++  assert(PMU_WIRE_PORT.regs[0x62] == 11); // Healthy again, recovery still waiting.
++  for (int i = 0; i < 11; ++i) { nowMs += 5000; board.loopPowerV3(); assert(PMU_WIRE_PORT.regs[0x62] == 11); }
++  nowMs += 5000; board.loopPowerV3(); assert(PMU_WIRE_PORT.regs[0x62] == 16);
++  PMU_WIRE_PORT.regs[0] |= 2; nowMs += 5000; board.loopPowerV3(); assert(PMU_WIRE_PORT.regs[0x62] == 11);
++  PMU_WIRE_PORT.regs[0] &= ~2;
++  PMU_WIRE_PORT.shortReg = 0x34; assert(!board.samplePower()); PMU_WIRE_PORT.shortReg = -1;
++  pmu.discardChargeWrite = true; assert(!board.applyChargeLimit(16) && !board._powerWriteOk);
++  pmu.discardChargeWrite = false;
++  char reply[140];
++  board.handlePowerCommand("get protections", reply, sizeof(reply)); assert(strstr(reply, "raw PMU"));
++  PMU_WIRE_PORT.failReg = 0x67;
++  board.handlePowerCommand("get protections", reply, sizeof(reply)); assert(strstr(reply, "read failed"));
++  PMU_WIRE_PORT.failReg = -1;
++  assert(board.handlePowerCommand("set usb limit 500", reply, sizeof(reply)) && Preferences::value == 500);
++  assert(board.handlePowerCommand("set usb limit 3000", reply, sizeof(reply)) && strstr(reply, "Error"));
++  Preferences::savedOk = false;
++  board.handlePowerCommand("set usb limit 1500", reply, sizeof(reply)); assert(strstr(reply, "NOT saved"));
++  Preferences::savedOk = true;
++  board.handlePowerCommand("set usb limit 1500", reply, sizeof(reply)); assert(Preferences::value == 1500);
++  TBeamBoard restored; restored.PMU = &pmu; restored.beginPowerV3();
++  assert(restored.samplePower() && restored._power.inputCode == 4 && restored._power.chargeCode == 16);
++  pmu.writeOk = false; assert(!board.applyChargeLimit(16));
++  board.handlePowerCommand("set usb limit 500", reply, sizeof(reply)); assert(strstr(reply, "failed"));
++  pmu.writeOk = true;
++  PMU_WIRE_PORT.regs[0x64] = XPOWERS_AXP2101_CHG_VOL_4V4;
++  nowMs += 5000; board.loopPowerV3(); assert(PMU_WIRE_PORT.regs[0x62] == 0 && !board._chargeVoltageOk);
++  PMU_WIRE_PORT.regs[0x64] = XPOWERS_AXP2101_CHG_VOL_4V2;
++  nowMs += 5000; board.loopPowerV3(); assert(PMU_WIRE_PORT.regs[0x62] == 0); // Latched until restart.
++  healthy(); TBeamBoard badBoot; badBoot.PMU = &pmu; PMU_WIRE_PORT.failReg = 0x64;
++  badBoot.beginPowerV3(); assert(!badBoot._powerConfigOk && PMU_WIRE_PORT.regs[0x62] == 0);
++  healthy(); pmu.model = 2; TBeamBoard other; other.PMU = &pmu;
++  int writes = pmu.chargeWrites; other.beginPowerV3(); other.loopPowerV3();
++  assert(pmu.chargeWrites == writes && !other.setGpsPower(true));
++  puts("PASS: actual PMU methods with simulated I2C faults, short reads, readback mismatch, recovery, wrong CV, NVS failure and wrong chip");
++}
+diff --git a/tests/hybrid_power/policy_test.cpp b/tests/hybrid_power/policy_test.cpp
+new file mode 100644
+index 00000000..1bd39585
+--- /dev/null
++++ b/tests/hybrid_power/policy_test.cpp
+@@ -0,0 +1,54 @@
++#include <helpers/PowerSavingUtils.h>
++#include <cassert>
++#include <cstdio>
++using namespace PowerSaving;
++int main() {
++  float fractional[] = {48.1f, 48.3f, 48.5f, 48.7f};
++  float negative[] = {-4.5f, -5.5f};
++  assert(fabs(meanTemperature(fractional, 4) - 48.4f) < 0.001f);
++  assert(meanTemperature(negative, 2) == -5.0f);
++  assert(isnan(meanTemperature(nullptr, 1)) && isnan(meanTemperature(negative, 0)));
++  for (float bad : {NAN, INFINITY, -INFINITY, -40.1f, 125.1f}) {
++    float samples[] = {20.0f, bad}; assert(isnan(meanTemperature(samples, 2)));
++  }
++  assert(idleDelay(100, false, 1000, 500, false, false) == 10);
++  assert(idleDelay(100, false, 105, 0, false, false) == 5);
++  assert(idleDelay(100, false, 0, 102, false, false) == 2);
++  assert(idleDelay(100, false, 100, 0, false, false) == 0);
++  assert(idleDelay(100, false, 99, 0, false, false) == 0);
++  assert(idleDelay(100, true, 0, 0, false, false) == 0);
++  assert(idleDelay(100, false, 0, 0, true, false) == 0);
++  assert(idleDelay(100, false, 0, 0, false, true) == 1);
++  assert(beforeDeadline(0xFFFFFFFCu, 3, 10) == 7);
++  assert(beforeDeadline(4, 0xFFFFFFFCu, 10) == 0);
++  assert(chargeMilliAmps(0) == 0 && chargeMilliAmps(8) == 200);
++  assert(chargeMilliAmps(11) == 500 && chargeMilliAmps(16) == 1000);
++  assert(chargeMilliAmps(17) == -1 && chargeMilliAmps(31) == -1);
++  assert(inputMilliAmps(1) == 500 && inputMilliAmps(4) == 1500);
++  assert(inputMilliAmps(6) == -1);
++  assert(!chargeBackoff(false, true, 40, false, false, true, 5000));
++  assert(chargeBackoff(false, true, 80, false, false, true, 5000));
++  assert(chargeBackoff(true, true, 71, false, false, true, 5000));
++  assert(!chargeBackoff(true, true, 70, false, false, true, 4750));
++  assert(chargeBackoff(false, false, 40, false, false, true, 5000));
++  assert(chargeBackoff(false, true, NAN, false, false, true, 5000));
++  assert(chargeBackoff(false, true, 40, true, false, true, 5000));
++  assert(chargeBackoff(false, true, 40, false, true, true, 5000));
++  assert(chargeBackoff(false, true, 40, false, false, true, 4499));
++  assert(chargeBackoff(true, true, 40, false, false, true, 4749));
++  assert(chargeBackoff(true, true, 40, false, false, false, 0));
++  ChargeRecovery recovery;
++  assert(recovery.limit(false, true, true, 100));
++  assert(recovery.limit(false, true, true, 60099));
++  assert(!recovery.limit(false, true, true, 60100));
++  assert(recovery.limit(true, false, true, 62000));
++  assert(recovery.limit(false, true, true, 65000));
++  assert(recovery.limit(true, true, true, 120000)); // A fault resets the timer.
++  assert(recovery.limit(false, true, true, 125000));
++  assert(recovery.limit(false, true, true, 184999));
++  assert(!recovery.limit(false, true, true, 185000));
++  ChargeRecovery wrap;
++  assert(wrap.limit(false, true, true, 0xFFFFFF00u));
++  assert(!wrap.limit(false, true, true, uint32_t(0xFFFFFF00u + 60000u)));
++  puts("PASS: temperature, charge bounds/backoff/recovery, idle deadlines and wraparound");
++}
+diff --git a/tests/hybrid_power/run.py b/tests/hybrid_power/run.py
+new file mode 100644
+index 00000000..ad0a7cba
+--- /dev/null
++++ b/tests/hybrid_power/run.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""Host tests; fake I/O is NOT proof of board current, rails or RF operation."""
++import pathlib
++import re
++import subprocess
++import tempfile
++
++ROOT = pathlib.Path(__file__).resolve().parents[2]
++HERE = pathlib.Path(__file__).resolve().parent
++
++
++def method(source, signature):
++    start = source.index(signature)
++    brace = source.index("{", start)
++    depth = 1
++    end = brace + 1
++    while depth:
++        if source[end] == "{":
++            depth += 1
++        elif source[end] == "}":
++            depth -= 1
++        end += 1
++    return source[start:end] + "\n"
++
++
++with tempfile.TemporaryDirectory(prefix="meshcore-ps3-tests-") as folder:
++    out = pathlib.Path(folder)
++    ui = (ROOT / "examples/companion_radio/ui-new/UITask.cpp").read_text()
++    (out / "display_methods.inc").write_text(method(ui, "void UITask::newMsg(") + method(ui, "char UITask::checkDisplayOn("))
++    board = (ROOT / "src/helpers/esp32/TBeamBoard.h").read_text()
++    blocks = re.findall(r"#ifdef TBEAM_HYBRID_POWER_V3\n(.*?)#endif", board, re.S)
++    assert len(blocks) == 2
++    (out / "power_board.inc").write_text("class TBeamBoard : public FakeBase { public: FakePMU* PMU = nullptr;\n" + "\n".join(blocks) + "\n};\n")
++    power = (ROOT / "src/helpers/esp32/TBeamPower.cpp").read_text()
++    (out / "power_methods.inc").write_text(re.sub(r"^#include .*\n", "", power, flags=re.M))
++    cases = [("policy", []), ("gps", []), ("display", ["-DTBEAM_HYBRID_POWER_V3=1"]), ("display", []),
++             ("pmu", ["-DTBEAM_HYBRID_POWER_V3=1", "-DTBEAM_SX1276=1"])]
++    for index, (case, defines) in enumerate(cases):
++        binary = out / f"test-{index}"
++        subprocess.run(["/usr/bin/c++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
++                        "-Wno-unused-parameter", "-include", "initializer_list", *defines,
++                        "-I", str(HERE / "mocks"), "-I", str(ROOT / "src"),
++                        "-I", str(ROOT / "variants/lilygo_tbeam_SX1276"), "-I", str(out),
++                        "-I", str(ROOT / ".pio/libdeps/Tbeam_SX1276_companion_radio_ble_ps/XPowersLib/src"),
++                        str(HERE / f"{case}_test.cpp"), "-o", str(binary)], check=True)
++        subprocess.run([str(binary)], check=True)
++
++# Check integration invariants in real source separately from behavioral tests.
++mesh = (ROOT / "examples/companion_radio/MyMesh.cpp").read_text()
++forward = method(mesh, "bool MyMesh::allowPacketForward(")
++assert re.search(r"#ifdef HYBRID_ALWAYS_REPEAT\s+return true;", forward)
++assert "isConnected" not in forward
++raw = method(mesh, "void MyMesh::logRxRaw(")
++assert "_serial->isConnected()" in raw and "snr" in raw and "rssi" in raw
++ini = (ROOT / "platformio.local.ini").read_text()
++assert "-D HYBRID_ALWAYS_REPEAT=1" in ini and "{869618,869618}" in ini
++assert "-D HYBRID_REMOTE_ADMIN=1" in ini and "ADV_TYPE_REPEATER" in ini
++assert "powersaving-arduino-lib/releases/download/2.0.17" in ini
++print("PASS: integration guards retain forwarding with BLE, raw mapping feed, 869.618 MHz, hybrid admin and ps framework", flush=True)
+-- 
+2.50.0

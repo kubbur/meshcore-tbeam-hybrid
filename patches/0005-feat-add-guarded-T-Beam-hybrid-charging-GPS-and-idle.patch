@@ -1,0 +1,698 @@
+From a55740fc1cd7750a1c29d25408de70f7c1efe583 Mon Sep 17 00:00:00 2001
+From: kubbur <kubbur@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 17:14:53 +0000
+Subject: [PATCH 5/7] feat: add guarded T-Beam hybrid charging GPS and idle
+ controls
+
+---
+ .../companion_radio/HybridRemoteAdmin.cpp     |  14 +-
+ examples/companion_radio/MyMesh.cpp           |  43 +++-
+ examples/companion_radio/MyMesh.h             |   3 +
+ examples/companion_radio/main.cpp             |  16 ++
+ examples/companion_radio/ui-new/UITask.cpp    |   4 +
+ platformio.local.ini                          |   5 +-
+ src/helpers/esp32/TBeamBoard.cpp              |  11 +-
+ src/helpers/esp32/TBeamBoard.h                |  33 +++
+ src/helpers/esp32/TBeamPower.cpp              | 193 ++++++++++++++++++
+ .../sensors/EnvironmentSensorManager.cpp      |  19 ++
+ .../lilygo_tbeam_SX1276/TBeamGpsProvider.h    |  82 ++++++++
+ variants/lilygo_tbeam_SX1276/target.cpp       |   6 +-
+ variants/lilygo_tbeam_SX1276/target.h         |   7 +-
+ 13 files changed, 425 insertions(+), 11 deletions(-)
+ create mode 100644 src/helpers/esp32/TBeamPower.cpp
+ create mode 100644 variants/lilygo_tbeam_SX1276/TBeamGpsProvider.h
+
+diff --git a/examples/companion_radio/HybridRemoteAdmin.cpp b/examples/companion_radio/HybridRemoteAdmin.cpp
+index 1ea20119..cad1d6aa 100644
+--- a/examples/companion_radio/HybridRemoteAdmin.cpp
++++ b/examples/companion_radio/HybridRemoteAdmin.cpp
+@@ -139,8 +139,8 @@ uint8_t MyMesh::handleAdminRequest(ClientInfo* sender, uint32_t sender_timestamp
+     telemetry.reset();
+     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
+     sensors.querySensors(permissions, telemetry);
+-    float temperature = board.getMCUTemperature();
+-    if (!isnan(temperature)) telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature);
++    float temperature = board.getTelemetryTemperature();
++    if (isfinite(temperature)) telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature);
+ 
+     uint8_t telemetry_len = telemetry.getSize();
+     memcpy(&admin_reply_data[4], telemetry.getBuffer(), telemetry_len);
+@@ -237,6 +237,16 @@ void MyMesh::handleAdminCommand(uint32_t sender_timestamp, char* command, char*
+     command += 3;
+   }
+ 
++#ifdef TBEAM_HYBRID_POWER_V3
++  // Called only after the existing authenticated-admin check. Keep replies
++  // short enough for a command frame, including a reflected client tag.
++  if (board.handlePowerCommand(command, reply, 140)) return;
++  if (strcmp(command, "get gps") == 0) {
++    nmea.formatStatus(reply, 140);
++    return;
++  }
++#endif
++
+   if (memcmp(command, "setperm ", 8) == 0) {
+     char* hex = &command[8];
+     char* separator = strchr(hex, ' ');
+diff --git a/examples/companion_radio/MyMesh.cpp b/examples/companion_radio/MyMesh.cpp
+index 5af12a71..0e3f34bb 100644
+--- a/examples/companion_radio/MyMesh.cpp
++++ b/examples/companion_radio/MyMesh.cpp
+@@ -2,6 +2,9 @@
+ 
+ #include <Arduino.h> // needed for PlatformIO
+ #include <Mesh.h>
++#ifdef TBEAM_HYBRID_POWER_V3
++#include <esp_pm.h>
++#endif
+ 
+ #define CMD_APP_START                 1
+ #define CMD_SEND_TXT_MSG              2
+@@ -713,8 +716,8 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
+       // query other sensors -- target specific
+       sensors.querySensors(permissions, telemetry);
+ 
+-      float temperature = board.getMCUTemperature();
+-      if(!isnan(temperature)) { // Supported boards with built-in temperature sensor. ESP32-C3 may return NAN
++      float temperature = board.getTelemetryTemperature();
++      if(isfinite(temperature)) {
+         telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature); // Built-in MCU Temperature
+       }
+ 
+@@ -1753,8 +1756,8 @@ void MyMesh::handleCmdFrame(size_t len) {
+   } else if (cmd_frame[0] == CMD_SEND_TELEMETRY_REQ && len == 4) {  // 'self' telemetry request
+     telemetry.reset();
+     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
+-    float temperature = board.getMCUTemperature();
+-    if(!isnan(temperature)) { // Supported boards with built-in temperature sensor. ESP32-C3 may return NAN
++    float temperature = board.getTelemetryTemperature();
++    if(isfinite(temperature)) {
+       telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature); // Built-in MCU Temperature
+     }
+ 
+@@ -2146,6 +2149,27 @@ void MyMesh::checkCLIRescueCmd() {
+   if (len > 0 && cli_command[len - 1] == '\r') {  // received complete line
+     cli_command[len - 1] = 0;  // replace newline with C string null terminator
+ 
++#ifdef TBEAM_HYBRID_POWER_V3
++    if (strcmp(cli_command, "get pm locks") == 0) {
++      // USB only: a full profiling dump is too large for a LoRa CLI response.
++      esp_err_t result = esp_pm_dump_locks(stdout);
++      Serial.printf("  > PM lock dump: %s (lock profiling is not sleep residency)\n", esp_err_to_name(result));
++      cli_command[0] = 0;
++      return;
++    }
++    char powerReply[160];
++    bool powerCommand = board.handlePowerCommand(cli_command, powerReply, sizeof(powerReply));
++    if (!powerCommand && strcmp(cli_command, "get gps") == 0) {
++      nmea.formatStatus(powerReply, sizeof(powerReply));
++      powerCommand = true;
++    }
++    if (powerCommand) {
++      Serial.println(powerReply);
++      cli_command[0] = 0;
++      return;
++    }
++#endif
++
+     if (memcmp(cli_command, "set ", 4) == 0) {
+       const char* config = &cli_command[4];
+       if (memcmp(config, "pin ", 4) == 0) {
+@@ -2391,3 +2415,14 @@ bool MyMesh::hasPendingWork() const {
+ #endif
+       ;
+ }
++
++#ifdef TBEAM_HYBRID_POWER_V3
++uint32_t MyMesh::getIdleDelayMs(bool bleReadPending, bool blePacing) const {
++  uint32_t aclDue = 0;
++#ifdef HYBRID_REMOTE_ADMIN
++  aclDue = dirty_admin_acl_expiry;
++#endif
++  return PowerSaving::idleDelay(_ms->getMillis(), _mgr->getOutboundTotal() > 0,
++      dirty_contacts_expiry, aclDue, bleReadPending, blePacing);
++}
++#endif
+diff --git a/examples/companion_radio/MyMesh.h b/examples/companion_radio/MyMesh.h
+index 4f898cc5..ca976b71 100644
+--- a/examples/companion_radio/MyMesh.h
++++ b/examples/companion_radio/MyMesh.h
+@@ -259,6 +259,9 @@ public:
+ 
+   // To check if there is pending work
+   bool hasPendingWork() const;
++#ifdef TBEAM_HYBRID_POWER_V3
++  uint32_t getIdleDelayMs(bool bleReadPending, bool blePacing) const;
++#endif
+ 
+ private:
+   void writeOKFrame();
+diff --git a/examples/companion_radio/main.cpp b/examples/companion_radio/main.cpp
+index 07ee269e..48c42180 100644
+--- a/examples/companion_radio/main.cpp
++++ b/examples/companion_radio/main.cpp
+@@ -140,6 +140,10 @@ void setup() {
+ #endif
+ 
+   if (!radio_init()) { halt(); }
++#ifdef TBEAM_HYBRID_POWER_V3
++  Serial.printf("Hybrid firmware: %s target=Tbeam_SX1276_companion_radio_ble_ps\n", FIRMWARE_VERSION);
++  Serial.println("Hybrid runtime: SX1276 radio initialization succeeded");
++#endif
+ 
+   fast_rng.begin(radio_driver.getRngSeed());
+ 
+@@ -287,10 +291,21 @@ void loop() {
+   ui_task.loop();
+ #endif
+   rtc_clock.tick();
++#ifdef TBEAM_HYBRID_POWER_V3
++  board.loopPowerV3();
++#endif
+ #ifdef HAS_EXTERNAL_WATCHDOG
+   external_watchdog.loop();
+ #endif
+ 
++#ifdef TBEAM_HYBRID_POWER_V3
++  uint32_t idle_ms = the_mesh.getIdleDelayMs(bluetooth_interface.isReadBusy(), bluetooth_interface.isWriteBusy());
++  if (idle_ms) {
++    uint32_t started = millis();
++    vTaskDelay(pdMS_TO_TICKS(idle_ms));
++    board.recordIdle((uint32_t)(millis() - started));
++  }
++#else
+   if (!the_mesh.hasPendingWork()) {
+ #if defined(NRF52_PLATFORM)
+     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
+@@ -300,6 +315,7 @@ void loop() {
+     }
+ #endif
+   }
++#endif
+ 
+ #if defined(ESP32) && defined(WIFI_SSID)
+   // Safely attempt to reconnect every 10 seconds if flagged
+diff --git a/examples/companion_radio/ui-new/UITask.cpp b/examples/companion_radio/ui-new/UITask.cpp
+index 051f3b31..a449966b 100644
+--- a/examples/companion_radio/ui-new/UITask.cpp
++++ b/examples/companion_radio/ui-new/UITask.cpp
+@@ -663,11 +663,15 @@ void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, i
+   setCurrScreen(msg_preview);
+ 
+   if (_display != NULL) {
++#ifndef TBEAM_HYBRID_POWER_V3
+     if (!_display->isOn() && !hasConnection()) {
+       _display->turnOn();
+     }
++#endif
+     if (_display->isOn()) {
++#ifndef TBEAM_HYBRID_POWER_V3
+     _auto_off = millis() + AUTO_OFF_MILLIS;  // extend the auto-off timer
++#endif
+     _next_refresh = 100;  // trigger refresh
+     }
+   }
+diff --git a/platformio.local.ini b/platformio.local.ini
+index 79931f81..db353a5b 100644
+--- a/platformio.local.ini
++++ b/platformio.local.ini
+@@ -4,8 +4,9 @@ extends = env:Tbeam_SX1276_companion_radio_ble
+ platform_packages = platformio/framework-arduinoespressif32@https://github.com/IoTThinks/powersaving-arduino-lib/releases/download/2.0.17/esp32-2.0.17.zip
+ build_flags =
+   ${env:Tbeam_SX1276_companion_radio_ble.build_flags}
+-  '-D FIRMWARE_VERSION="v1.17.1-hybrid-ps2"'
+-  '-D FIRMWARE_BUILD_DATE="16 Sep 2026"'
++  '-D FIRMWARE_VERSION="v1.17.1-hybrid-ps3-rc1"'
++  '-D FIRMWARE_BUILD_DATE="22 Sep 2026"'
++  -D TBEAM_HYBRID_POWER_V3=1
+   '-D ALLOWED_REPEAT_FREQ_RANGE={433000,433000},{869495,869495},{869618,869618},{918000,918000}'
+   -D HYBRID_REMOTE_ADMIN=1
+   -D HYBRID_ALWAYS_REPEAT=1
+diff --git a/src/helpers/esp32/TBeamBoard.cpp b/src/helpers/esp32/TBeamBoard.cpp
+index d9f6e022..b8d5e4d0 100644
+--- a/src/helpers/esp32/TBeamBoard.cpp
++++ b/src/helpers/esp32/TBeamBoard.cpp
+@@ -27,6 +27,9 @@ void TBeamBoard::begin() {
+ #endif
+ 
+     power_init();
++#ifdef TBEAM_HYBRID_POWER_V3
++    beginPowerV3();
++#endif
+ 
+     //Configure user button
+     pinMode(PIN_USER_BTN, INPUT);
+@@ -265,13 +268,19 @@ bool TBeamBoard::power_init()
+       PMU->enablePowerOutput(XPOWERS_ALDO2);                //Enable LoRa power rail
+ 
+       PMU->setPowerChannelVoltage(XPOWERS_ALDO3, 3300);     //Set up GPS power rail
++#ifdef TBEAM_HYBRID_POWER_V3
++      PMU->disablePowerOutput(XPOWERS_ALDO3); // GPS provider owns this rail.
++#else
+       PMU->enablePowerOutput(XPOWERS_ALDO3);                //Enable GPS power rail
++#endif
+   
+     #endif
+ 
+     PMU->disableIRQ(XPOWERS_AXP2101_ALL_IRQ);      //Disable all PMU interrupts
+ 
+-    PMU->setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_500MA);   //Set battery charging current to 500mA
++#ifndef TBEAM_HYBRID_POWER_V3
++    PMU->setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_500MA);
++#endif
+     PMU->setChargeTargetVoltage(XPOWERS_AXP2101_CHG_VOL_4V2);     //Set battery charging cutoff voltage to 4.2V
+ 
+   }
+diff --git a/src/helpers/esp32/TBeamBoard.h b/src/helpers/esp32/TBeamBoard.h
+index 98bd16bf..dbf6daad 100644
+--- a/src/helpers/esp32/TBeamBoard.h
++++ b/src/helpers/esp32/TBeamBoard.h
+@@ -114,6 +114,28 @@ enum {
+ bool power_init();
+ //void radiotype_detect();
+ 
++#ifdef TBEAM_HYBRID_POWER_V3
++  struct PowerSnapshot {
++    bool valid = false;
++    uint32_t sampledAt = 0;
++    uint8_t status[2] = {};
++    uint8_t chargeCode = 0, inputCode = 0, voltageCode = 0, ldo = 0;
++    uint16_t battMv = 0, vbusMv = 0, systemMv = 0;
++    float pmuTemperature = NAN;
++  } _power;
++  uint32_t _nextPowerSample = 0;
++  uint32_t _yieldCalls = 0, _yieldMillis = 0;
++  bool _chargeLimited = false, _powerConfigOk = false, _powerWriteOk = true;
++  bool _chargeVoltageOk = false;
++  PowerSaving::ChargeRecovery _chargeRecovery;
++  uint16_t _usbLimitMa = 500; // Unknown USB source until explicitly configured.
++  bool readPmu(uint8_t reg, uint8_t* data, size_t count);
++  bool samplePower();
++  bool applyChargeLimit(uint8_t code);
++  bool applyUsbLimit(uint16_t milliamps);
++  void beginPowerV3();
++#endif
++
+ public:
+ 
+ #ifdef MESH_DEBUG
+@@ -122,6 +144,17 @@ public:
+ #endif
+   void begin();
+ 
++#ifdef TBEAM_HYBRID_POWER_V3
++  bool setGpsPower(bool enabled);
++  void loopPowerV3();
++  bool handlePowerCommand(const char* command, char* reply, size_t capacity);
++  void recordIdle(uint32_t elapsed) { ++_yieldCalls; _yieldMillis += elapsed; }
++  // Keep die temperatures in explicitly labelled diagnostics, not the generic
++  // app field which is commonly mistaken for ambient/battery temperature.
++  float getTelemetryTemperature() override { return NAN; }
++  bool isExternalPowered() override { return _power.valid && (_power.status[0] & 0x20); }
++#endif
++
+   #ifndef TBEAM_SUPREME_SX1262
+   void onBeforeTransmit() override{
+     digitalWrite(P_LORA_TX_LED, LOW);   // turn TX LED on - invert pin for SX1276
+diff --git a/src/helpers/esp32/TBeamPower.cpp b/src/helpers/esp32/TBeamPower.cpp
+new file mode 100644
+index 00000000..26d68757
+--- /dev/null
++++ b/src/helpers/esp32/TBeamPower.cpp
+@@ -0,0 +1,193 @@
++#if defined(TBEAM_HYBRID_POWER_V3) && defined(TBEAM_SX1276)
++
++#include "TBeamBoard.h"
++#include <Preferences.h>
++#include <helpers/PowerSavingUtils.h>
++
++// Target-specific to the classic AXP2101 board. Never reinterpret AXP192
++// registers. Unlike convenience getters, every snapshot checks I2C reads.
++bool TBeamBoard::readPmu(uint8_t reg, uint8_t* data, size_t count) {
++  if (!PMU || PMU->getChipModel() != XPOWERS_AXP2101) return false;
++  PMU_WIRE_PORT.beginTransmission(I2C_PMU_ADD);
++  PMU_WIRE_PORT.write(reg);
++  if (PMU_WIRE_PORT.endTransmission(false) != 0) return false;
++  if (PMU_WIRE_PORT.requestFrom((uint8_t)I2C_PMU_ADD, count) != count) {
++    while (PMU_WIRE_PORT.available()) PMU_WIRE_PORT.read();
++    return false;
++  }
++  for (size_t i = 0; i < count; ++i) data[i] = PMU_WIRE_PORT.read();
++  return true;
++}
++
++bool TBeamBoard::samplePower() {
++  PowerSnapshot next;
++  uint8_t adcControl, adc[10];
++  if (!readPmu(XPOWERS_AXP2101_STATUS1, next.status, 2)
++      || !readPmu(XPOWERS_AXP2101_ADC_CHANNEL_CTRL, &adcControl, 1)
++      || !readPmu(XPOWERS_AXP2101_ADC_DATA_RELUST0, adc, sizeof(adc))
++      || !readPmu(XPOWERS_AXP2101_ICC_CHG_SET, &next.chargeCode, 1)
++      || !readPmu(XPOWERS_AXP2101_INPUT_CUR_LIMIT_CTRL, &next.inputCode, 1)
++      || !readPmu(XPOWERS_AXP2101_CV_CHG_VOL_SET, &next.voltageCode, 1)
++      || !readPmu(XPOWERS_AXP2101_LDO_ONOFF_CTRL0, &next.ldo, 1)) {
++    _power.valid = false;
++    return false;
++  }
++  auto adc14 = [&adc](int i) -> uint16_t { return ((adc[i] & 0x3F) << 8) | adc[i + 1]; };
++  next.battMv = (next.status[0] & 8) ? ((adc[0] & 0x1F) << 8) | adc[1] : 0;
++  next.vbusMv = (next.status[0] & 0x20) ? adc14(4) : 0;
++  next.systemMv = adc14(6);
++  next.pmuTemperature = XPOWERS_AXP2101_CONVERSION(adc14(8));
++  next.valid = (adcControl & 0x1D) == 0x1D
++      && isfinite(next.pmuTemperature) && next.pmuTemperature >= -40.0f && next.pmuTemperature <= 125.0f
++      && PowerSaving::chargeMilliAmps(next.chargeCode) >= 0
++      && PowerSaving::inputMilliAmps(next.inputCode) >= 0;
++  next.sampledAt = millis();
++  _power = next;
++  return next.valid;
++}
++
++bool TBeamBoard::applyChargeLimit(uint8_t code) {
++  uint8_t actual = 0;
++  bool ok = PMU && PMU->getChipModel() == XPOWERS_AXP2101
++      && PMU->setChargerConstantCurr(code)
++      && readPmu(XPOWERS_AXP2101_ICC_CHG_SET, &actual, 1) && (actual & 0x1F) == code;
++  _powerWriteOk = ok;
++  return ok;
++}
++
++bool TBeamBoard::applyUsbLimit(uint16_t milliamps) {
++  // Explicit profiles, not adapter detection. 1500 mA is for the user's rated
++  // car supply; select 500 before using a USB source of unknown capability.
++  if (milliamps != 500 && milliamps != 1500) return false;
++  uint8_t code = milliamps == 1500 ? XPOWERS_AXP2101_VBUS_CUR_LIM_1500MA : XPOWERS_AXP2101_VBUS_CUR_LIM_500MA;
++  uint8_t actual = 0;
++  bool ok = PMU && PMU->getChipModel() == XPOWERS_AXP2101 && PMU->setVbusCurrentLimit(code)
++      && readPmu(XPOWERS_AXP2101_INPUT_CUR_LIMIT_CTRL, &actual, 1) && (actual & 7) == code;
++  if (ok) _usbLimitMa = milliamps;
++  _powerWriteOk = ok;
++  return ok;
++}
++
++void TBeamBoard::beginPowerV3() {
++  if (!PMU || PMU->getChipModel() != XPOWERS_AXP2101) {
++    Serial.println("Hybrid power: unsupported or missing PMU; fast charge not applied");
++    return;
++  }
++  Preferences prefs;
++  if (prefs.begin("hybrid_ps3", true)) {
++    _usbLimitMa = prefs.getUShort("usb_ma", 500);
++    prefs.end();
++  }
++  if (_usbLimitMa != 500 && _usbLimitMa != 1500) _usbLimitMa = 500;
++  bool inputOk = applyUsbLimit(_usbLimitMa);
++  uint8_t adcControl = 0;
++  bool adcOk = PMU->enableTemperatureMeasure()
++      && readPmu(XPOWERS_AXP2101_ADC_CHANNEL_CTRL, &adcControl, 1) && (adcControl & 0x1D) == 0x1D;
++  uint8_t voltage = 0;
++  bool voltageOk = readPmu(XPOWERS_AXP2101_CV_CHG_VOL_SET, &voltage, 1) && (voltage & 7) == XPOWERS_AXP2101_CHG_VOL_4V2;
++  _chargeVoltageOk = voltageOk;
++  // Never request fast charging when voltage or input setup is unverified.
++  bool chargeOk = applyChargeLimit(voltageOk ? (inputOk && adcOk ? XPOWERS_AXP2101_CHG_CUR_1000MA
++      : XPOWERS_AXP2101_CHG_CUR_500MA) : 0);
++  _powerConfigOk = inputOk && chargeOk && adcOk && voltageOk;
++  _chargeLimited = !_powerConfigOk;
++  _powerWriteOk = _powerConfigOk;
++  _nextPowerSample = millis() + 2000; // Let the ADC settle without delaying RX.
++  Serial.printf("Hybrid power: target=1000mA USB-limit=%umA CV-target=4.2V config=%s; battery-temp=unavailable\n",
++      _usbLimitMa, _powerConfigOk ? "verified" : "ERROR");
++  Serial.println("Hybrid power: screen=manual GPS=rail-controlled deep-sleep=disabled/unvalidated repeat=always");
++}
++
++bool TBeamBoard::setGpsPower(bool enabled) {
++  if (!PMU || PMU->getChipModel() != XPOWERS_AXP2101) return false;
++  bool ok = enabled ? PMU->enablePowerOutput(XPOWERS_ALDO3) : PMU->disablePowerOutput(XPOWERS_ALDO3);
++  uint8_t value = 0;
++  return ok && readPmu(XPOWERS_AXP2101_LDO_ONOFF_CTRL0, &value, 1) && ((value & 4) != 0) == enabled;
++}
++
++void TBeamBoard::loopPowerV3() {
++  if (!PMU || PMU->getChipModel() != XPOWERS_AXP2101 || (int32_t)(millis() - _nextPowerSample) < 0) return;
++  _nextPowerSample = millis() + 5000;
++  bool valid = samplePower();
++  bool limited = !_powerConfigOk || PowerSaving::chargeBackoff(_chargeLimited, valid, _power.pmuTemperature,
++      (_power.status[0] & 2) != 0, (_power.status[0] & 1) != 0 || (_power.status[1] & 8) != 0,
++      (_power.status[0] & 0x20) != 0, _power.vbusMv);
++  limited = _chargeRecovery.limit(limited, _chargeLimited, valid && (_power.status[0] & 0x20), millis());
++  uint8_t code = limited ? XPOWERS_AXP2101_CHG_CUR_500MA : XPOWERS_AXP2101_CHG_CUR_1000MA;
++  // A known wrong charge voltage is not a reason merely to reduce current.
++  if (valid && (_power.voltageCode & 7) != XPOWERS_AXP2101_CHG_VOL_4V2) _chargeVoltageOk = false;
++  if (!valid || !_chargeVoltageOk) {
++    code = 0;
++    limited = true;
++    if (!_chargeVoltageOk) _powerConfigOk = false;
++  }
++  _chargeLimited = limited; // Requested protection state; actual current is read separately.
++  if (!valid || (_power.chargeCode & 0x1F) != code) {
++    if (applyChargeLimit(code)) {
++      // Do not claim the old snapshot still represents a new setting.
++      _power.valid = false;
++    }
++  }
++}
++
++bool TBeamBoard::handlePowerCommand(const char* command, char* reply, size_t capacity) {
++  if (strcmp(command, "get protections") == 0) {
++    const uint8_t registers[] = {XPOWERS_AXP2101_DIE_TEMP_CTRL, XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL,
++        XPOWERS_AXP2101_ITERM_CHG_SET_CTRL, XPOWERS_AXP2101_CV_CHG_VOL_SET, XPOWERS_AXP2101_THE_REGU_THRES_SET,
++        XPOWERS_AXP2101_CHG_TIMEOUT_SET_CTRL};
++    uint8_t values[sizeof(registers)];
++    for (size_t i = 0; i < sizeof(registers); ++i) {
++      if (!readPmu(registers[i], &values[i], 1)) {
++        snprintf(reply, capacity, "Error: protection register read failed; no settings changed");
++        return true;
++      }
++    }
++    snprintf(reply, capacity, "> raw PMU 13=%02X 18=%02X 63=%02X 64=%02X 65=%02X 67=%02X; battery_temp=unavailable",
++        values[0], values[1], values[2], values[3], values[4], values[5]);
++  } else if (strcmp(command, "get sleep") == 0) {
++    snprintf(reply, capacity, "> deep=disabled: retained-state/RX wake unvalidated; BLE stays available; repeat=always");
++  } else if (strcmp(command, "get idle") == 0) {
++    snprintf(reply, capacity, "> task_yields=%lu yielded_ms=%lu (not sleep residency); CPU_now=%uMHz",
++        (unsigned long)_yieldCalls, (unsigned long)_yieldMillis, getCpuFrequencyMhz());
++  } else if (strncmp(command, "set usb limit ", 14) == 0) {
++    const char* value = command + 14;
++    uint16_t limit = strcmp(value, "500") == 0 ? 500 : strcmp(value, "1500") == 0 ? 1500 : 0;
++    if (!limit) {
++      snprintf(reply, capacity, "Error: use set usb limit 500 or 1500 (rated supply only)");
++    } else if (!applyUsbLimit(limit)) {
++      snprintf(reply, capacity, "Error: USB limit write/readback failed; current state unknown");
++    } else {
++      Preferences prefs;
++      bool saved = prefs.begin("hybrid_ps3", false);
++      if (saved) { saved = prefs.putUShort("usb_ma", limit) == sizeof(uint16_t); prefs.end(); }
++      _power.valid = false;
++      snprintf(reply, capacity, saved ? "OK USB input limit=%umA saved; battery target=1000mA" : "Error: limit=%umA applied but NOT saved", limit);
++    }
++  } else if (strcmp(command, "get power") == 0 || strcmp(command, "get charge") == 0
++      || strcmp(command, "get temps") == 0 || strcmp(command, "get rails") == 0) {
++    if (!_power.valid) {
++      snprintf(reply, capacity, "> PMU sample unavailable; config=%s last_write=%s battery_temp=unavailable",
++          _powerConfigOk ? "verified" : "ERROR", _powerWriteOk ? "OK" : "ERROR");
++    } else if (strcmp(command, "get power") == 0) {
++      snprintf(reply, capacity, "> VBUS=%umV batt=%umV sys=%umV dir=%u phase=%u age=%lums",
++          _power.vbusMv, _power.battMv, _power.systemMv, (_power.status[1] >> 5) & 3,
++          _power.status[1] & 7, (unsigned long)(millis() - _power.sampledAt));
++    } else if (strcmp(command, "get charge") == 0) {
++      snprintf(reply, capacity, "> target=1000mA read=%dmA USB=%dmA backoff=%u thermal=%u input=%u write=%s (limits; not measured)",
++          PowerSaving::chargeMilliAmps(_power.chargeCode), PowerSaving::inputMilliAmps(_power.inputCode), _chargeLimited,
++          (_power.status[0] >> 1) & 1, ((_power.status[0] & 1) != 0) || ((_power.status[1] & 8) != 0),
++          _powerWriteOk ? "OK" : "ERROR");
++    } else if (strcmp(command, "get temps") == 0) {
++      snprintf(reply, capacity, "> MCU_uncal=%.1fC PMU_die=%.1fC battery=unavailable ambient=unavailable",
++          getMCUTemperature(), _power.pmuTemperature);
++    } else {
++      snprintf(reply, capacity, "> GPS_ALDO3=%u radio_ALDO2=%u GPS_backup=unchanged screen=manual",
++          (_power.ldo >> 2) & 1, (_power.ldo >> 1) & 1);
++    }
++  } else {
++    return false;
++  }
++  return true;
++}
++
++#endif
+diff --git a/src/helpers/sensors/EnvironmentSensorManager.cpp b/src/helpers/sensors/EnvironmentSensorManager.cpp
+index e2f0d33e..9f92994b 100644
+--- a/src/helpers/sensors/EnvironmentSensorManager.cpp
++++ b/src/helpers/sensors/EnvironmentSensorManager.cpp
+@@ -667,9 +667,16 @@ bool EnvironmentSensorManager::begin() {
+ bool EnvironmentSensorManager::querySensors(uint8_t requester_permissions, CayenneLPP& telemetry) {
+   next_available_channel = TELEM_CHANNEL_SELF + 1;
+ 
++#if defined(TBEAM_HYBRID_POWER_V3) && ENV_INCLUDE_GPS
++  if ((requester_permissions & TELEM_PERM_LOCATION) && gps_active && _location->isValid()) {
++    telemetry.addGPS(TELEM_CHANNEL_SELF, _location->getLatitude() / 1000000.0,
++        _location->getLongitude() / 1000000.0, _location->getAltitude() / 1000.0);
++  }
++#else
+   if (requester_permissions & TELEM_PERM_LOCATION && gps_active) {
+     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
+   }
++#endif
+ 
+   if (requester_permissions & TELEM_PERM_ENVIRONMENT) {
+     for (int i = 0; i < _active_sensor_count; i++) {
+@@ -732,6 +739,15 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
+ #if ENV_INCLUDE_GPS
+ void EnvironmentSensorManager::initBasicGPS() {
+ 
++#ifdef TBEAM_HYBRID_POWER_V3
++  // This target has an onboard GPS. Keep its setting available without a
++  // one-second cold-start probe, and leave main power off until prefs ask for it.
++  _location->stop();
++  gps_detected = true;
++  gps_active = false;
++  return;
++#endif
++
+   Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
+ 
+   #ifdef GPS_BAUD_RATE
+@@ -871,6 +887,9 @@ void EnvironmentSensorManager::start_gps() {
+   _location->begin();
+   _location->reset();
+ 
++#ifdef TBEAM_HYBRID_POWER_V3
++  gps_active = _location->isEnabled();
++#endif
+ #ifndef PIN_GPS_EN
+   MESH_DEBUG_PRINTLN("Start GPS is N/A on this board. Actual GPS state unchanged");
+ #endif
+diff --git a/variants/lilygo_tbeam_SX1276/TBeamGpsProvider.h b/variants/lilygo_tbeam_SX1276/TBeamGpsProvider.h
+new file mode 100644
+index 00000000..c0b95252
+--- /dev/null
++++ b/variants/lilygo_tbeam_SX1276/TBeamGpsProvider.h
+@@ -0,0 +1,82 @@
++#pragma once
++
++#include <helpers/sensors/MicroNMEALocationProvider.h>
++#include <LilygoTBeamSX1276Board.h>
++
++// Own the GPS main supply and UART together. The backup supply is never cut.
++// PIN_GPS_TX is the module's TX (ESP32 RX); PIN_GPS_RX is ESP32 TX.
++class TBeamGpsProvider : public MicroNMEALocationProvider {
++  LilygoTBeamSX1276Board& _board;
++  bool _started = false;
++  bool _haveFix = false;
++  uint32_t _fixAt = 0;
++  long _fixEpoch = 0;
++
++public:
++  TBeamGpsProvider(LilygoTBeamSX1276Board& board, mesh::RTCClock* clock)
++      : MicroNMEALocationProvider(Serial1, clock), _board(board) {}
++
++  void begin() override {
++    if (_started) return;
++    Serial1.end();
++    if (!_board.setGpsPower(true)) {
++      _board.setGpsPower(false); // Best-effort undo if enable/readback failed.
++      return;
++    }
++#ifdef GPS_BAUD_RATE
++    const uint32_t baud = GPS_BAUD_RATE;
++#else
++    const uint32_t baud = 9600;
++#endif
++    Serial1.begin(baud, SERIAL_8N1, PIN_GPS_TX, PIN_GPS_RX);
++    MicroNMEALocationProvider::begin();
++    MicroNMEALocationProvider::syncTime();
++    _haveFix = false;
++    _started = true;
++  }
++
++  void stop() override {
++    if (_started) MicroNMEALocationProvider::stop();
++    Serial1.end();
++    // Avoid powering an unpowered receiver through the MCU's idle-high TX.
++    pinMode(PIN_GPS_RX, INPUT);
++    pinMode(PIN_GPS_TX, INPUT);
++    _board.setGpsPower(false);
++    MicroNMEALocationProvider::syncTime();
++    _haveFix = false;
++    _started = false;
++  }
++
++  bool isEnabled() override { return _started; }
++  void sendSentence(const char* sentence) override {
++    if (_started) MicroNMEALocationProvider::sendSentence(sentence);
++  }
++  bool isValid() override {
++    return _started && _haveFix && (uint32_t)(millis() - _fixAt) <= 10000
++        && MicroNMEALocationProvider::isValid();
++  }
++
++  void loop() override {
++    if (!_started) return;
++    MicroNMEALocationProvider::loop();
++    if (MicroNMEALocationProvider::isValid()) {
++      long epoch = MicroNMEALocationProvider::getTimestamp();
++      // GGA can arrive before a dated RMC sentence. Do not accept an unset
++      // date as a fresh position/time after the receiver is power-cycled.
++      if (epoch >= 1577836800L && (!_haveFix || epoch != _fixEpoch)) {
++        _fixEpoch = epoch;
++        _fixAt = millis();
++        _haveFix = true;
++      }
++    }
++  }
++
++  void formatStatus(char* reply, size_t capacity) {
++    if (!_haveFix) {
++      snprintf(reply, capacity, "> gps=%s fix=none sats=%ld", _started ? "on" : "off", satellitesCount());
++    } else {
++      snprintf(reply, capacity, "> gps=%s fix=%s age=%lus sats=%ld", _started ? "on" : "off",
++          isValid() ? "valid" : "stale", (unsigned long)((millis() - _fixAt) / 1000), satellitesCount());
++    }
++  }
++};
+diff --git a/variants/lilygo_tbeam_SX1276/target.cpp b/variants/lilygo_tbeam_SX1276/target.cpp
+index 30f23dab..ef249249 100644
+--- a/variants/lilygo_tbeam_SX1276/target.cpp
++++ b/variants/lilygo_tbeam_SX1276/target.cpp
+@@ -16,8 +16,12 @@ ESP32RTCClock fallback_clock;
+ AutoDiscoverRTCClock rtc_clock(fallback_clock);
+ 
+ #if ENV_INCLUDE_GPS
++  #ifdef TBEAM_HYBRID_POWER_V3
++  TBeamGpsProvider nmea(board, &rtc_clock);
++  #else
+   #include <helpers/sensors/MicroNMEALocationProvider.h>
+   MicroNMEALocationProvider nmea = MicroNMEALocationProvider(Serial1, &rtc_clock);
++  #endif
+   EnvironmentSensorManager sensors = EnvironmentSensorManager(nmea);
+ #else
+   EnvironmentSensorManager sensors;
+@@ -42,4 +46,4 @@ bool radio_init() {
+ mesh::LocalIdentity radio_new_identity() {
+   RadioNoiseListener rng(radio);
+   return mesh::LocalIdentity(&rng);  // create new random identity
+-}
+\ No newline at end of file
++}
+diff --git a/variants/lilygo_tbeam_SX1276/target.h b/variants/lilygo_tbeam_SX1276/target.h
+index 0d56f88f..f8f25d5c 100644
+--- a/variants/lilygo_tbeam_SX1276/target.h
++++ b/variants/lilygo_tbeam_SX1276/target.h
+@@ -1,5 +1,10 @@
+ #pragma once
+ 
++#ifdef TBEAM_HYBRID_POWER_V3
++#include "TBeamGpsProvider.h"
++extern TBeamGpsProvider nmea;
++#endif
++
+ #define RADIOLIB_STATIC_ONLY 1
+ //#include <RadioLib.h>
+ #include <helpers/radiolib/RadioLibWrappers.h>
+@@ -23,4 +28,4 @@ extern EnvironmentSensorManager sensors;
+ #endif
+ 
+ bool radio_init();
+-mesh::LocalIdentity radio_new_identity();
+\ No newline at end of file
++mesh::LocalIdentity radio_new_identity();
+-- 
+2.50.0

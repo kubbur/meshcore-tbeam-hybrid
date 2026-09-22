@@ -1,0 +1,243 @@
+From ed1bbe3d0c27fb2490980fa59a20ee1a6d8db4b5 Mon Sep 17 00:00:00 2001
+From: kubbur <kubbur@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 22:40:28 +0000
+Subject: [PATCH 7/7] fix: recover hybrid charging and report canonical repeat
+ state
+
+---
+ docs/tbeam-hybrid-ps3.md                      | 12 +++-
+ .../companion_radio/HybridRemoteAdmin.cpp     |  4 +-
+ platformio.local.ini                          |  2 +-
+ src/helpers/PowerSavingUtils.h                |  5 +-
+ tests/hybrid_power/admin_test.cpp             | 67 +++++++++++++++++++
+ tests/hybrid_power/pmu_test.cpp               | 29 ++++++++
+ tests/hybrid_power/policy_test.cpp            | 10 ++-
+ tests/hybrid_power/run.py                     |  5 +-
+ 8 files changed, 127 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hybrid_power/admin_test.cpp
+
+diff --git a/docs/tbeam-hybrid-ps3.md b/docs/tbeam-hybrid-ps3.md
+index 36c66155..0bf0ae29 100644
+--- a/docs/tbeam-hybrid-ps3.md
++++ b/docs/tbeam-hybrid-ps3.md
+@@ -1,12 +1,20 @@
+ # T-Beam hybrid ps3 test firmware
+ 
+-Target: classic T-Beam V1.2, SX1276, AXP2101, 4 MB ESP32; `Tbeam_SX1276_companion_radio_ble_ps`. Version: `v1.17.1-hybrid-ps3-rc1`. This is a hardware-test candidate, not a battery-life-validated release.
++Target: classic T-Beam V1.2, SX1276, AXP2101, 4 MB ESP32; `Tbeam_SX1276_companion_radio_ble_ps`. Version: `v1.17.1-hybrid-ps3-rc2`. This is a hardware-test candidate, not a battery-life-validated release.
++
++## rc2 charging correction
++
++Remove the separate **4.75 V recovery gate**. The user's rc1 readings of 4.658-4.671 V, with thermal/input hardware-limit flags clear, could never satisfy that gate after backoff. Recovery now needs sixty seconds of samples with VBUS at least 4.5 V, PMU die at most 70 C and no hardware limiting. The 4.5 V low-input backoff, 1 A charge ceiling, temperature supervision, invalid-read handling, 4.2 V checks and hardware protections are unchanged. This does not establish the actual USB voltage or charging current on hardware; supervise and measure the first rc2 charging test.
++
++## rc2 remote repeater-switch correction
++
++Return the stock `> on` response to `get repeat`, including any echoed client tag, instead of `> on (locked)`. MeshCore One's `CLIResponse.parse` compares the value exactly with `on`/`off`; the annotation was not parsed as an enabled state in Remote Management settings. Inspected client source: [CLIResponse.swift at f841f2f](https://github.com/Avi0n/MeshCoreOne/blob/f841f2fe58d6992a2a4ba68a9a49e6b7b93269a1/MC1Services/Sources/MC1Services/Services/CLIResponse.swift). The app version installed on the user's phone was not inspected. The firmware still refuses `set repeat off`, always forwards eligible packets, and retains its BLE Companion identity. No client change is required for the response-format fix; confirmation in the phone GUI remains a hardware acceptance check.
+ 
+ ## Implemented
+ 
+ - Preserve the ps2 single identity: BLE Companion/CHAT, REPEATER LoRa adverts, authenticated tagged remote CLI, always-on repeating including while BLE is connected, and the 869.618 MHz allowance. No radio-power reduction or framework upgrade.
+ - Set the supported charge target to **1000 mA**, retaining 4.2 V. Verify PMU writes/readback and ADC setup. A fresh install separately limits USB input to **500 mA**; explicitly select **1500 mA input** on a suitable supply to provide headroom for both charging and the running board. The firmware cannot recognise the adapter. A selected input profile persists, so choose 500 before returning to an unknown/weak USB source.
+-- Sample PMU state every five seconds. Reduce the requested charge limit to 500 mA on PMU-die temperature at least 80 C, hardware limiting, or VBUS below 4.5 V. Require at most 70 C, at least 4.75 V and sixty seconds of healthy samples to restore 1 A. Failed samples request a 0 mA **constant-current** limit; a wrong/unverified charge voltage is latched conservative until restart. These are software requests, not proof of measured current or complete charger isolation. Failed I2C writes cannot guarantee a change and are reported as errors.
++- Sample PMU state every five seconds. Reduce the requested charge limit to 500 mA on PMU-die temperature at least 80 C, hardware limiting, or VBUS below 4.5 V. Require at most 70 C, at least 4.5 V and sixty seconds of healthy samples to restore 1 A. Failed samples request a 0 mA **constant-current** limit; a wrong/unverified charge voltage is latched conservative until restart. These are software requests, not proof of measured current or complete charger isolation. Failed I2C writes cannot guarantee a change and are reported as errors.
+ - Do not change hardware thermal thresholds, termination or safety-timer configuration. Read raw protection registers on demand. The existing board configuration has TS measurement disabled; **there is no battery-temperature protection supplied by this change**. PMU temperature is not cell temperature. Charging hardware can remain active when application supervision stops. Cell/enclosure testing is still required.
+ - GPS off shuts down its UART, releases UART pins to input, and disables ALDO3 with readback. ALDO2 (radio) and GPS backup supply are not switched. Saved GPS enable/disable preferences remain in the existing format; no new GPS-on default. GPS-off startup avoids the old cold-start detection pulse. The GPS setting remains available for this known onboard-GPS target.
+ - Ignore stale/undated fixes; fresh GPS telemetry requires a currently enabled receiver and a fix updated within ten seconds. Fixed node/advert coordinates are still a separate saved feature and may remain the last location; do not treat those as a live fix.
+diff --git a/examples/companion_radio/HybridRemoteAdmin.cpp b/examples/companion_radio/HybridRemoteAdmin.cpp
+index cad1d6aa..79ef2ce5 100644
+--- a/examples/companion_radio/HybridRemoteAdmin.cpp
++++ b/examples/companion_radio/HybridRemoteAdmin.cpp
+@@ -285,7 +285,9 @@ void MyMesh::handleAdminCommand(uint32_t sender_timestamp, char* command, char*
+     return;
+   }
+   if (strcmp(command, "get repeat") == 0) {
+-    strcpy(reply, "> on (locked)");
++    // Keep the stock machine-readable value. MeshCore One compares exactly
++    // with "on"; annotations such as "(locked)" leave its GUI switch unset.
++    strcpy(reply, "> on");
+     return;
+   }
+ 
+diff --git a/platformio.local.ini b/platformio.local.ini
+index db353a5b..7c5d3deb 100644
+--- a/platformio.local.ini
++++ b/platformio.local.ini
+@@ -4,7 +4,7 @@ extends = env:Tbeam_SX1276_companion_radio_ble
+ platform_packages = platformio/framework-arduinoespressif32@https://github.com/IoTThinks/powersaving-arduino-lib/releases/download/2.0.17/esp32-2.0.17.zip
+ build_flags =
+   ${env:Tbeam_SX1276_companion_radio_ble.build_flags}
+-  '-D FIRMWARE_VERSION="v1.17.1-hybrid-ps3-rc1"'
++  '-D FIRMWARE_VERSION="v1.17.1-hybrid-ps3-rc2"'
+   '-D FIRMWARE_BUILD_DATE="22 Sep 2026"'
+   -D TBEAM_HYBRID_POWER_V3=1
+   '-D ALLOWED_REPEAT_FREQ_RANGE={433000,433000},{869495,869495},{869618,869618},{918000,918000}'
+diff --git a/src/helpers/PowerSavingUtils.h b/src/helpers/PowerSavingUtils.h
+index d54ace99..ab881ec7 100644
+--- a/src/helpers/PowerSavingUtils.h
++++ b/src/helpers/PowerSavingUtils.h
+@@ -52,7 +52,10 @@ inline bool chargeBackoff(bool wasLimited, bool valid, float pmuTemperature,
+   if (!valid || !isfinite(pmuTemperature)) return true;
+   if (!external) return wasLimited;
+   if (thermalLimited || inputLimited || pmuTemperature >= 80.0f || vbusMv < 4500) return true;
+-  if (wasLimited && (pmuTemperature > 70.0f || vbusMv < 4750)) return true;
++  // No separate 4.75 V recovery gate: it held a healthy 4.66 V input at
++  // 500 mA indefinitely. Keep the 4.5 V floor above, temperature hysteresis
++  // and the full-minute healthy-sample recovery delay below.
++  if (wasLimited && pmuTemperature > 70.0f) return true;
+   return false;
+ }
+ 
+diff --git a/tests/hybrid_power/admin_test.cpp b/tests/hybrid_power/admin_test.cpp
+new file mode 100644
+index 00000000..99750c58
+--- /dev/null
++++ b/tests/hybrid_power/admin_test.cpp
+@@ -0,0 +1,67 @@
++#include <algorithm>
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++using std::min;
++constexpr int PUB_KEY_SIZE = 32, MAX_LORA_TX_POWER = 20;
++constexpr uint8_t PERM_ACL_ROLE_MASK = 3, PERM_ACL_GUEST = 0;
++constexpr uint32_t HYBRID_LAZY_ACL_WRITE_DELAY = 1000;
++uint32_t futureMillis(uint32_t delay) { return delay; }
++namespace mesh {
++struct Identity { explicit Identity(const uint8_t*) {} };
++struct Utils { static bool fromHex(uint8_t*, int, const char*) { return false; } };
++}
++struct FakePrefs {
++  bool enabled = true;
++  void setRepeatEn(bool value) { enabled = value; }
++};
++struct FakeACL {
++  bool applyPermissions(int, const uint8_t*, int, uint8_t) { return false; }
++};
++struct FakeCLI {
++  int calls = 0;
++  void handleCommand(uint32_t, char*, char* reply) { ++calls; strcpy(reply, "delegated"); }
++};
++struct FakeBoard { bool handlePowerCommand(const char*, char*, size_t) { return false; } } board;
++struct FakeNMEA { void formatStatus(char* reply, size_t) { strcpy(reply, "> gps=off"); } } nmea;
++class MyMesh {
++public:
++  FakePrefs _prefs;
++  FakeACL admin_acl;
++  FakeCLI admin_cli;
++  int self_id = 0, saves = 0;
++  uint32_t dirty_admin_acl_expiry = 0;
++  void savePrefs() { ++saves; _prefs.setRepeatEn(true); }
++  void seedAdminContact(const mesh::Identity&) {}
++  bool isValidClientRepeatFreq(uint32_t frequency) { return frequency == 869618; }
++  void handleAdminCommand(uint32_t sender_timestamp, char* command, char* reply);
++};
++// Execute the full production dispatcher, including tag reflection and locks.
++// The test substitutes dependencies; it is not an RF/authentication test.
++#include "admin_method.inc"
++
++int main() {
++  MyMesh node;
++  auto check = [&node](const char* request, const char* expected) {
++    char command[160], reply[160]{};
++    strcpy(command, request);
++    node.handleAdminCommand(123, command, reply);
++    assert(strcmp(reply, expected) == 0);
++    assert(node._prefs.enabled);
++  };
++  check("get repeat", "> on");
++  check("01|get repeat", "01|> on");
++  check("  AF|get repeat", "AF|> on");
++  assert(node.saves == 0 && node.admin_cli.calls == 0);
++  check("set repeat off", "Error: repeat is locked on in hybrid firmware");
++  check("02|set repeat off", "02|Error: repeat is locked on in hybrid firmware");
++  assert(node.saves == 0);
++  check("03|set repeat on", "03|OK - repeat is locked ON");
++  assert(node.saves == 1);
++  check("04|get repeat", "04|> on");
++  check("05|ver", "05|delegated");
++  assert(node.admin_cli.calls == 1);
++  puts("PASS: actual remote-admin dispatcher emits canonical on, reflects tags, preserves repeat lock and delegates unchanged commands");
++}
+diff --git a/tests/hybrid_power/pmu_test.cpp b/tests/hybrid_power/pmu_test.cpp
+index 87ab18fe..96785c22 100644
+--- a/tests/hybrid_power/pmu_test.cpp
++++ b/tests/hybrid_power/pmu_test.cpp
+@@ -124,6 +124,35 @@ int main() {
+   nowMs += 5000; board.loopPowerV3(); assert(PMU_WIRE_PORT.regs[0x62] == 0); // Latched until restart.
+   healthy(); TBeamBoard badBoot; badBoot.PMU = &pmu; PMU_WIRE_PORT.failReg = 0x64;
+   badBoot.beginPowerV3(); assert(!badBoot._powerConfigOk && PMU_WIRE_PORT.regs[0x62] == 0);
++  // Reproduce the user's 4.658-4.671 V readings after a hardware-limit event.
++  // Recovery must no longer require the unrelated 4.75 V threshold.
++  for (uint16_t mv : {4500, 4658, 4659, 4670, 4671, 4749}) {
++    healthy(); FakePMU recoveryPmu; TBeamBoard recovery; recovery.PMU = &recoveryPmu;
++    recovery.beginPowerV3();
++    assert(recovery.handlePowerCommand("set usb limit 1500", reply, sizeof(reply)));
++    adc(0x38, mv);
++    PMU_WIRE_PORT.regs[0] |= 1; // Hardware input limiting initially requests backoff.
++    nowMs = 2000; recovery.loopPowerV3();
++    assert(PMU_WIRE_PORT.regs[0x62] == 11 && recovery._chargeLimited);
++    PMU_WIRE_PORT.regs[0] &= ~1;
++    for (int i = 0; i < 12; ++i) {
++      nowMs += 5000; recovery.loopPowerV3();
++      assert(PMU_WIRE_PORT.regs[0x62] == 11 && recovery._chargeLimited);
++    }
++    nowMs += 5000; recovery.loopPowerV3();
++    assert(PMU_WIRE_PORT.regs[0x62] == 16 && !recovery._chargeLimited);
++    nowMs += 5000; recovery.loopPowerV3();
++    recovery.handlePowerCommand("get charge", reply, sizeof(reply));
++    assert(strstr(reply, "read=1000mA USB=1500mA backoff=0"));
++    assert(strstr(reply, "limits; not measured"));
++    // A subsequent low-input event still reduces the limit and needs fresh recovery.
++    adc(0x38, 4499); nowMs += 5000; recovery.loopPowerV3();
++    assert(PMU_WIRE_PORT.regs[0x62] == 11 && recovery._chargeLimited);
++    adc(0x38, mv); nowMs += 5000; recovery.loopPowerV3();
++    assert(PMU_WIRE_PORT.regs[0x62] == 11 && recovery._chargeLimited);
++    for (int i = 0; i < 12; ++i) { nowMs += 5000; recovery.loopPowerV3(); }
++    assert(PMU_WIRE_PORT.regs[0x62] == 16 && !recovery._chargeLimited);
++  }
+   healthy(); pmu.model = 2; TBeamBoard other; other.PMU = &pmu;
+   int writes = pmu.chargeWrites; other.beginPowerV3(); other.loopPowerV3();
+   assert(pmu.chargeWrites == writes && !other.setGpsPower(true));
+diff --git a/tests/hybrid_power/policy_test.cpp b/tests/hybrid_power/policy_test.cpp
+index 1bd39585..1382cb2c 100644
+--- a/tests/hybrid_power/policy_test.cpp
++++ b/tests/hybrid_power/policy_test.cpp
+@@ -35,7 +35,15 @@ int main() {
+   assert(chargeBackoff(false, true, 40, true, false, true, 5000));
+   assert(chargeBackoff(false, true, 40, false, true, true, 5000));
+   assert(chargeBackoff(false, true, 40, false, false, true, 4499));
+-  assert(chargeBackoff(true, true, 40, false, false, true, 4749));
++  // rc1 stayed at 500 mA indefinitely in this otherwise healthy voltage band.
++  for (uint16_t mv : {4500, 4658, 4659, 4670, 4671, 4749, 4750}) {
++    assert(!chargeBackoff(true, true, 40, false, false, true, mv));
++    assert(!chargeBackoff(false, true, 40, false, false, true, mv));
++  }
++  assert(chargeBackoff(true, true, 40, false, false, true, 4499));
++  assert(chargeBackoff(true, true, 71, false, false, true, 4658));
++  assert(chargeBackoff(true, true, 40, true, false, true, 4658));
++  assert(chargeBackoff(true, true, 40, false, true, true, 4658));
+   assert(chargeBackoff(true, true, 40, false, false, false, 0));
+   ChargeRecovery recovery;
+   assert(recovery.limit(false, true, true, 100));
+diff --git a/tests/hybrid_power/run.py b/tests/hybrid_power/run.py
+index ad0a7cba..d38f2ba5 100644
+--- a/tests/hybrid_power/run.py
++++ b/tests/hybrid_power/run.py
+@@ -33,8 +33,11 @@ with tempfile.TemporaryDirectory(prefix="meshcore-ps3-tests-") as folder:
+     (out / "power_board.inc").write_text("class TBeamBoard : public FakeBase { public: FakePMU* PMU = nullptr;\n" + "\n".join(blocks) + "\n};\n")
+     power = (ROOT / "src/helpers/esp32/TBeamPower.cpp").read_text()
+     (out / "power_methods.inc").write_text(re.sub(r"^#include .*\n", "", power, flags=re.M))
++    admin = (ROOT / "examples/companion_radio/HybridRemoteAdmin.cpp").read_text()
++    (out / "admin_method.inc").write_text(method(admin, "void MyMesh::handleAdminCommand("))
+     cases = [("policy", []), ("gps", []), ("display", ["-DTBEAM_HYBRID_POWER_V3=1"]), ("display", []),
+-             ("pmu", ["-DTBEAM_HYBRID_POWER_V3=1", "-DTBEAM_SX1276=1"])]
++             ("pmu", ["-DTBEAM_HYBRID_POWER_V3=1", "-DTBEAM_SX1276=1"]),
++             ("admin", ["-DTBEAM_HYBRID_POWER_V3=1"])]
+     for index, (case, defines) in enumerate(cases):
+         binary = out / f"test-{index}"
+         subprocess.run(["/usr/bin/c++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+-- 
+2.50.0
+

@@ -1,3 +1,7 @@
 8aa9927f0068fe19c6cfeee9745dfa2ff071f48c58bc4fafcba17f99aa374111  0001-feat-add-T-Beam-hybrid-companion-repeater.patch
 f83577d0a958db9f8bddffde63f6d4df9e924ba545a8b8cefdf892b92273e229  0002-fix-preserve-T-Beam-power-saving-behavior.patch
 9881834f403b8d253f06f30472129ec43823ef50927e08b44d5b1499ada8d3e0  0003-fix-accept-tagged-remote-admin-commands.patch
+1be63fabd0bd1ff6825edb5481cec899cb5dd0f4ffb6ebe717e2c1894101f07e  0004-fix-preserve-temperature-precision-and-add-tested-po.patch
+67a23d26f8423899a9500313d990671a458ea2eff4f44760b6c0177e61a7d64d  0005-feat-add-guarded-T-Beam-hybrid-charging-GPS-and-idle.patch
+5d36d43d986a10995d216961e5c5e745e378e2bd67067566a0fab829c7bdd1b3  0006-test-cover-hybrid-power-failure-cases-and-document-h.patch
+3a16ae14ec975d16eae19cd4583a173faf311e2f97f416285b00556ff8a481b9  0007-fix-recover-hybrid-charging-and-report-canonical-rep.patch
